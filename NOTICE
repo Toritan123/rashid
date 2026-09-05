@@ -1,0 +1,20 @@
+Rashid
+Copyright 2026 Toritan123
+
+Licensed under the Apache License, Version 2.0. See LICENSE for the full
+text.
+
+Provenance
+----------
+Rashid is an independent, clean-room implementation. It contains no Apple
+code and is not derived from Apple's Rosetta translation software. The
+instruction decoder is written from the Intel Software Developer's Manual,
+the loader from the public <mach-o/loader.h> headers, and the calling
+convention conversion from the published System V x86-64 and AAPCS64 ABI
+documents. See CONTRIBUTING.md for the contribution policy that keeps this
+provenance defensible.
+
+Trademarks
+----------
+"Rosetta", "macOS" and "Apple Silicon" are trademarks of Apple Inc. Rashid
+is not affiliated with, authorized by, or endorsed by Apple Inc.

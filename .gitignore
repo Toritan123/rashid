@@ -1,0 +1,19 @@
+# Build output
+rashid
+*.o
+*.dSYM/
+tests/*.x86
+tools/objc_live
+__pycache__/
+
+# NEVER COMMIT APPLE BINARIES.
+# Rashid is a clean-room implementation. Copies of Apple's shared caches,
+# Rosetta runtime, SDKs or extracted system dylibs are useful for local
+# analysis but must never enter this repository. See CONTRIBUTING.md.
+rosetta-archive*/
+*-extracted/
+dyld_shared_cache*
+aot_shared_cache*
+libRosettaRuntime
+*.aot
+*.sdk/

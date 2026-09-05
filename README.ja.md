@@ -176,7 +176,7 @@ ObjC 面は事実上 100% 自動生成できる。手書きが要るのは C 関
 | T0 | 共有キャッシュ読み取り (`tools/dsc.py`) | **完了** |
 | M1a | ゲストアドレス空間の分離 | **完了** |
 | M1b | TLS (`%gs`) 完了。mmap とシグナルが残り | 一部 |
-| M2 | SSE2 + x87 (80bit はソフト実装) | |
+| M2 | SSE 完了。x87 が残り | 一部 |
 | M3 | dyld 相当: 依存解決、chained fixups、stub の thunk 化 | |
 | M4 | `objc_msgSend` thunk の自動生成 → 最初の Cocoa アプリ起動 | |
 | M5 | basic-block JIT (MAP_JIT + `pthread_jit_write_protect_np`) | |

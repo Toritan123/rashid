@@ -14,7 +14,7 @@ $(BIN): $(SRC) src/as.h src/macho.h src/cpu.h
 tests/%.x86: tests/%.c
 	clang -arch x86_64 -nostdlib -static -Wl,-e,_start -O1 -o $@ $<
 
-GUESTS = hello arith tls ripimm fault
+GUESTS = hello arith tls ripimm sse fault
 
 test: $(BIN) $(GUESTS:%=tests/%.x86)
 	@./tests/run.sh

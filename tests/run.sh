@@ -40,6 +40,7 @@ run_case hello  0
 run_case arith  55
 run_case tls    15
 run_case ripimm 255
+run_case sse    21
 
 echo
 echo "== fault containment (a broken guest must not take down the translator) =="

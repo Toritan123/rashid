@@ -83,11 +83,42 @@ make test
   and installs it with the machine-dependent syscall `0x3000003`;
   `pthread_getspecific` is then one instruction, `movq %gs:(,%rdi,8), %rax`.
   (`%fs` is never used on macOS — zero occurrences across all of libsystem.)
+- **SSE**, covering 99.3% of the SIMD instructions compiler-generated x86_64
+  code actually executes (see below): 16-byte and scalar moves, bitwise ops,
+  scalar and packed float arithmetic, comparisons, conversions.
 - A few macOS syscalls, dispatched by class: `read`, `write`, `close`,
   `exit`, `thread_fast_set_cthread_self`
 
-Not yet: anything that imports a dylib (so: every real application), SSE/AVX,
+Not yet: anything that imports a dylib (so: every real application), AVX,
 x87, signals, threads, guest `mmap`.
+
+### Which SSE instructions matter
+
+Chosen by measurement rather than by reading the manual front to back.
+Counting what a framework's compiled code actually contains — Foundation,
+3.2M instructions, as a stand-in for application code:
+
+| | count | |
+|---|---|---|
+| `movups` / `movaps` | 63,923 | struct copies and spilling xmm |
+| `movsd` / `movapd` / `movupd` | 9,614 | moving doubles |
+| `xorps` / `xorpd` | 5,107 | zeroing |
+| `ucomisd` `addsd` `mulsd` `subsd` | 2,432 | scalar double arithmetic |
+
+Almost all of it is 16-byte moves and scalar double math; packed integer SSE
+barely appears. That is a very different profile from hand-written assembly
+in libSystem, where `memcpy` and `strlen` dominate — and libSystem is exactly
+what Rashid does *not* translate.
+
+XMM support is unavoidable regardless: the x86_64 ABI passes floating-point
+arguments in xmm0-7 and returns in xmm0, so even calling a native function
+that takes a `double` goes through it.
+
+Of the 86,615 SIMD instructions in Foundation, 86,013 are implemented. The
+remaining 0.7% is a long tail of 57 SSE3/SSSE3/SSE4.1 opcodes — `pinsrb`,
+`blendvpd`, `movddup`, `punpcklqdq` and friends. Hitting one stops the guest
+with the opcode and its mandatory prefix printed, since for `0F` opcodes the
+prefix is what selects the instruction.
 
 ### Guest address space
 
@@ -118,6 +149,7 @@ against a live native run of the very same binary.
   arith    rashid=55   native=55   ok
   tls      rashid=15   native=15   ok
   ripimm   rashid=255  native=255  ok
+  sse      rashid=21   native=21   ok
 ```
 
 The live comparison is the valuable one: it checks against the actual CPU
@@ -138,7 +170,7 @@ plausible nearby address instead of faulting.
 | T0 | shared-cache reader (`tools/dsc.py`) | done |
 | M1a | guest address space separation | done |
 | M1b | TLS (`%gs`) — done; guest `mmap` and signals remain | partial |
-| M2 | SSE2 and x87 | |
+| M2 | SSE — done; x87 remains | partial |
 | M3 | dyld equivalent: dependency resolution, chained fixups, stub thunking | |
 | **M4** | **generated `objc_msgSend` thunks — first Cocoa application launches** | |
 | M5 | basic-block JIT (`MAP_JIT` + `pthread_jit_write_protect_np`) | |

@@ -26,11 +26,24 @@
 enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI,
        R8,  R9,  R10, R11, R12, R13, R14, R15 };
 
+// One XMM register. The x86_64 ABI passes floating-point arguments in
+// xmm0-7 and returns in xmm0, so these are needed for the calling convention
+// alone, before any vector code enters the picture.
+typedef union {
+    uint8_t  b[16];
+    uint16_t w[8];
+    uint32_t d[4];
+    uint64_t q[2];
+    float    f[4];
+    double   lf[2];
+} rsd_xmm;
+
 enum { F_CF = 1u << 0, F_PF = 1u << 2, F_AF = 1u << 4,
        F_ZF = 1u << 6, F_SF = 1u << 7, F_OF = 1u << 11 };
 
 typedef struct {
     uint64_t r[16];
+    rsd_xmm  xmm[16];
     uint64_t rip;
     uint64_t cur_rip;     // start of the instruction being executed
     uint32_t flags;

@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 #include <unistd.h>
 #include <sys/mman.h>
 
@@ -192,6 +193,7 @@ typedef struct {
     int      opsize; // 1/2/4/8
     bool     addr32;
     uint64_t seg_base;
+    uint8_t  mand;   // mandatory SSE prefix: 0, 0x66, 0xF2 or 0xF3
 } dec;
 
 static uint8_t  fetch8 (dec *d) { return *d->p++; }
@@ -345,6 +347,385 @@ static void do_syscall(rsd_cpu *c) {
     syscall_ret(c, ret);
 }
 
+
+// ------------------------------------------------------------------- SSE
+// Measured against compiler-generated x86_64 code, SIMD use is overwhelmingly
+// 16-byte moves and scalar double arithmetic - movups and movaps alone are
+// three quarters of it, and packed integer SSE barely appears. XMM support is
+// unavoidable in any case: the x86_64 ABI passes floating-point arguments in
+// xmm0-7 and returns in xmm0.
+//
+// The mandatory prefix selects the variant of a 0F opcode:
+//   none = packed single, 66 = packed double / integer,
+//   F3   = scalar single, F2 = scalar double.
+
+static void ld128(rsd_cpu *c, uint64_t a, rsd_xmm *o) {
+    if (!rsd_as_ok(c->as, a, 16, RSD_PROT_R)) {
+        memfault(c, a, why(c, a, 16, "read"));
+        memset(o, 0, sizeof *o);
+        return;
+    }
+    memcpy(o, rsd_g2h(c->as, a), 16);
+}
+
+static void st128(rsd_cpu *c, uint64_t a, const rsd_xmm *v) {
+    if (!rsd_as_ok(c->as, a, 16, RSD_PROT_W)) {
+        memfault(c, a, why(c, a, 16, "write"));
+        return;
+    }
+    memcpy(rsd_g2h(c->as, a), v, 16);
+}
+
+static void xrd(rsd_cpu *c, const opnd *o, rsd_xmm *out) {
+    if (o->is_reg) *out = c->xmm[o->reg];
+    else           ld128(c, o->addr + o->seg, out);
+}
+
+static void xwr(rsd_cpu *c, const opnd *o, const rsd_xmm *v) {
+    if (o->is_reg) c->xmm[o->reg] = *v;
+    else           st128(c, o->addr + o->seg, v);
+}
+
+// Scalar operand: `bytes` from a register's low lane or from memory.
+static uint64_t xrd_lo(rsd_cpu *c, const opnd *o, int bytes) {
+    if (o->is_reg) return bytes == 4 ? c->xmm[o->reg].d[0] : c->xmm[o->reg].q[0];
+    return ld(c, o->addr + o->seg, bytes);
+}
+
+// COMISD/UCOMISD: unordered sets ZF, PF and CF together; OF, AF and SF clear.
+static void comis(rsd_cpu *c, double a, double b) {
+    c->flags &= ~(F_OF | F_AF | F_SF | F_ZF | F_PF | F_CF);
+    if (isnan(a) || isnan(b)) c->flags |= F_ZF | F_PF | F_CF;
+    else if (a < b)           c->flags |= F_CF;
+    else if (a == b)          c->flags |= F_ZF;
+}
+
+// CMPPS/CMPPD/CMPSS/CMPSD predicates. C's == on floating point compiles to
+// these rather than to ucomis, so they turn up in ordinary code constantly.
+static bool fcmp(uint8_t pred, double x, double y) {
+    bool un = isnan(x) || isnan(y);
+    switch (pred & 7) {
+    case 0: return !un && x == y;      // EQ  (ordered)
+    case 1: return !un && x <  y;      // LT
+    case 2: return !un && x <= y;      // LE
+    case 3: return un;                 // UNORD
+    case 4: return un || x != y;       // NEQ (unordered)
+    case 5: return un || !(x <  y);    // NLT
+    case 6: return un || !(x <= y);    // NLE
+    default: return !un;               // ORD
+    }
+}
+
+static double fbin(uint8_t op2, double x, double y) {
+    switch (op2) {
+    case 0x58: return x + y;
+    case 0x59: return x * y;
+    case 0x5C: return x - y;
+    case 0x5E: return x / y;
+    // MIN/MAX return the second operand when the inputs are unordered or
+    // equal, which is why these are not written as fmin/fmax.
+    case 0x5D: return x < y ? x : y;
+    default:   return x > y ? x : y;
+    }
+}
+
+// Returns true if the opcode was handled. Must not consume any bytes when it
+// returns false, so unknown opcodes fall through to the caller untouched.
+static bool sse_exec(rsd_cpu *c, dec *d, uint8_t op2, uint64_t start) {
+    opnd rm;
+    int reg;
+    rsd_xmm a, b;
+
+    switch (op2) {
+
+    // ---- 16-byte and scalar moves ----
+    case 0x10: case 0x11:            // movups/movss/movupd/movsd
+    case 0x28: case 0x29: {          // movaps/movapd
+        bool store = (op2 & 1);      // .11 and .29 write the r/m operand
+        reg = modrm(d, &rm);
+        fixup_rip(d, &rm);
+        c->rip = dec_rip(d);
+        opnd ro = { .is_reg = true, .reg = reg };
+        opnd *dst = store ? &rm : &ro, *src = store ? &ro : &rm;
+
+        if (op2 <= 0x11 && (d->mand == 0xF3 || d->mand == 0xF2)) {
+            int n = (d->mand == 0xF3) ? 4 : 8;   // movss / movsd
+            uint64_t v = xrd_lo(c, src, n);
+            if (dst->is_reg) {
+                if (src->is_reg) {
+                    // register to register keeps the rest of the destination
+                    if (n == 4) c->xmm[dst->reg].d[0] = (uint32_t)v;
+                    else        c->xmm[dst->reg].q[0] = v;
+                } else {
+                    memset(&c->xmm[dst->reg], 0, sizeof(rsd_xmm));
+                    if (n == 4) c->xmm[dst->reg].d[0] = (uint32_t)v;
+                    else        c->xmm[dst->reg].q[0] = v;
+                }
+            } else {
+                st(c, dst->addr + dst->seg, v, n);
+            }
+            return true;
+        }
+        xrd(c, src, &a);
+        xwr(c, dst, &a);
+        return true;
+    }
+
+    case 0x6F: case 0x7F: {          // movdqa (66) / movdqu (F3)
+        if (d->mand != 0x66 && d->mand != 0xF3) return false;
+        bool store = (op2 == 0x7F);
+        reg = modrm(d, &rm);
+        fixup_rip(d, &rm);
+        c->rip = dec_rip(d);
+        opnd ro = { .is_reg = true, .reg = reg };
+        xrd(c, store ? &ro : &rm, &a);
+        xwr(c, store ? &rm : &ro, &a);
+        return true;
+    }
+
+    case 0x6E: {                     // movd/movq xmm, r/m
+        if (d->mand != 0x66) return false;
+        reg = modrm(d, &rm);
+        fixup_rip(d, &rm);
+        c->rip = dec_rip(d);
+        int n = (d->rex & 8) ? 8 : 4;
+        uint64_t v = rm.is_reg ? getreg(c, rm.reg, n) : ld(c, rm.addr + rm.seg, n);
+        memset(&c->xmm[reg], 0, sizeof(rsd_xmm));
+        c->xmm[reg].q[0] = v;
+        return true;
+    }
+
+    case 0x7E: {                     // movd/movq r/m, xmm (66) or movq xmm (F3)
+        reg = modrm(d, &rm);
+        fixup_rip(d, &rm);
+        c->rip = dec_rip(d);
+        if (d->mand == 0xF3) {       // movq xmm, xmm/m64 - zeroes the top half
+            uint64_t v = xrd_lo(c, &rm, 8);
+            memset(&c->xmm[reg], 0, sizeof(rsd_xmm));
+            c->xmm[reg].q[0] = v;
+            return true;
+        }
+        if (d->mand != 0x66) return false;
+        int n = (d->rex & 8) ? 8 : 4;
+        uint64_t v = c->xmm[reg].q[0];
+        if (rm.is_reg) setreg(c, rm.reg, v, n);
+        else           st(c, rm.addr + rm.seg, v, n);
+        return true;
+    }
+
+    case 0xD6: {                     // movq xmm/m64, xmm
+        if (d->mand != 0x66) return false;
+        reg = modrm(d, &rm);
+        fixup_rip(d, &rm);
+        c->rip = dec_rip(d);
+        if (rm.is_reg) {
+            memset(&c->xmm[rm.reg], 0, sizeof(rsd_xmm));
+            c->xmm[rm.reg].q[0] = c->xmm[reg].q[0];
+        } else {
+            st(c, rm.addr + rm.seg, c->xmm[reg].q[0], 8);
+        }
+        return true;
+    }
+
+    // ---- bitwise: 128 bits regardless of the prefix ----
+    case 0x54: case 0x55: case 0x56: case 0x57:   // and/andn/or/xor ps,pd
+    case 0xDB: case 0xEB: case 0xEF: {            // pand/por/pxor
+        if (op2 >= 0xDB && d->mand != 0x66) return false;
+        reg = modrm(d, &rm);
+        fixup_rip(d, &rm);
+        c->rip = dec_rip(d);
+        xrd(c, &rm, &b);
+        a = c->xmm[reg];
+        for (int i = 0; i < 2; i++) {
+            switch (op2) {
+            case 0x54: case 0xDB: a.q[i] &= b.q[i]; break;
+            case 0x55:            a.q[i] = ~a.q[i] & b.q[i]; break;
+            case 0x56: case 0xEB: a.q[i] |= b.q[i]; break;
+            default:              a.q[i] ^= b.q[i]; break;
+            }
+        }
+        c->xmm[reg] = a;
+        return true;
+    }
+
+    // ---- arithmetic ----
+    case 0x51: case 0x58: case 0x59:
+    case 0x5C: case 0x5D: case 0x5E: case 0x5F: {
+        reg = modrm(d, &rm);
+        fixup_rip(d, &rm);
+        c->rip = dec_rip(d);
+        a = c->xmm[reg];
+        if (d->mand == 0xF2) {                      // scalar double
+            union { uint64_t u; double f; } s;
+            s.u = xrd_lo(c, &rm, 8);
+            a.lf[0] = (op2 == 0x51) ? sqrt(s.f) : fbin(op2, a.lf[0], s.f);
+        } else if (d->mand == 0xF3) {               // scalar single
+            union { uint32_t u; float f; } s;
+            s.u = (uint32_t)xrd_lo(c, &rm, 4);
+            a.f[0] = (op2 == 0x51) ? sqrtf(s.f)
+                                   : (float)fbin(op2, a.f[0], s.f);
+        } else if (d->mand == 0x66) {               // packed double
+            xrd(c, &rm, &b);
+            for (int i = 0; i < 2; i++)
+                a.lf[i] = (op2 == 0x51) ? sqrt(b.lf[i]) : fbin(op2, a.lf[i], b.lf[i]);
+        } else {                                    // packed single
+            xrd(c, &rm, &b);
+            for (int i = 0; i < 4; i++)
+                a.f[i] = (op2 == 0x51) ? sqrtf(b.f[i])
+                                       : (float)fbin(op2, a.f[i], b.f[i]);
+        }
+        c->xmm[reg] = a;
+        return true;
+    }
+
+    // ---- compare ----
+    case 0x2E: case 0x2F: {          // ucomiss/ucomisd, comiss/comisd
+        reg = modrm(d, &rm);
+        fixup_rip(d, &rm);
+        c->rip = dec_rip(d);
+        if (d->mand == 0x66) {
+            union { uint64_t u; double f; } s;
+            s.u = xrd_lo(c, &rm, 8);
+            comis(c, c->xmm[reg].lf[0], s.f);
+        } else {
+            union { uint32_t u; float f; } s;
+            s.u = (uint32_t)xrd_lo(c, &rm, 4);
+            comis(c, (double)c->xmm[reg].f[0], (double)s.f);
+        }
+        return true;
+    }
+
+    // ---- conversions ----
+    case 0x2A: {                     // cvtsi2ss / cvtsi2sd
+        if (d->mand != 0xF2 && d->mand != 0xF3) return false;
+        reg = modrm(d, &rm);
+        fixup_rip(d, &rm);
+        c->rip = dec_rip(d);
+        int n = (d->rex & 8) ? 8 : 4;
+        int64_t v = (int64_t)sext(rm.is_reg ? getreg(c, rm.reg, n)
+                                            : ld(c, rm.addr + rm.seg, n), n);
+        if (d->mand == 0xF2) c->xmm[reg].lf[0] = (double)v;
+        else                 c->xmm[reg].f[0]  = (float)v;
+        return true;
+    }
+
+    case 0x2C: case 0x2D: {          // cvt(t)ss2si / cvt(t)sd2si
+        if (d->mand != 0xF2 && d->mand != 0xF3) return false;
+        reg = modrm(d, &rm);
+        fixup_rip(d, &rm);
+        c->rip = dec_rip(d);
+        double v;
+        if (d->mand == 0xF2) { union { uint64_t u; double f; } s;
+                               s.u = xrd_lo(c, &rm, 8); v = s.f; }
+        else                 { union { uint32_t u; float f; } s;
+                               s.u = (uint32_t)xrd_lo(c, &rm, 4); v = (double)s.f; }
+        // 2C truncates, 2D rounds to nearest even (the default rounding mode).
+        double r = (op2 == 0x2C) ? trunc(v) : nearbyint(v);
+        int n = (d->rex & 8) ? 8 : 4;
+        setreg(c, reg, (uint64_t)(int64_t)r, n);
+        return true;
+    }
+
+    case 0x5A: {                     // cvtss2sd / cvtsd2ss
+        if (d->mand != 0xF2 && d->mand != 0xF3) return false;
+        reg = modrm(d, &rm);
+        fixup_rip(d, &rm);
+        c->rip = dec_rip(d);
+        if (d->mand == 0xF3) {       // single -> double
+            union { uint32_t u; float f; } s;
+            s.u = (uint32_t)xrd_lo(c, &rm, 4);
+            c->xmm[reg].lf[0] = (double)s.f;
+        } else {                     // double -> single
+            union { uint64_t u; double f; } s;
+            s.u = xrd_lo(c, &rm, 8);
+            c->xmm[reg].f[0] = (float)s.f;
+        }
+        return true;
+    }
+
+    // ---- packed integer compare and mask ----
+    case 0x74: case 0x76: {          // pcmpeqb / pcmpeqd
+        if (d->mand != 0x66) return false;
+        reg = modrm(d, &rm);
+        fixup_rip(d, &rm);
+        c->rip = dec_rip(d);
+        xrd(c, &rm, &b);
+        a = c->xmm[reg];
+        if (op2 == 0x74) for (int i = 0; i < 16; i++) a.b[i] = a.b[i] == b.b[i] ? 0xff : 0;
+        else             for (int i = 0; i < 4;  i++) a.d[i] = a.d[i] == b.d[i] ? 0xffffffffu : 0;
+        c->xmm[reg] = a;
+        return true;
+    }
+
+    case 0xD7: {                     // pmovmskb
+        if (d->mand != 0x66) return false;
+        reg = modrm(d, &rm);
+        fixup_rip(d, &rm);
+        c->rip = dec_rip(d);
+        if (!rm.is_reg) return false;
+        uint64_t m = 0;
+        for (int i = 0; i < 16; i++)
+            if (c->xmm[rm.reg].b[i] & 0x80) m |= 1ull << i;
+        setreg(c, reg, m, 8);
+        return true;
+    }
+
+    case 0x70: {                     // pshufd
+        if (d->mand != 0x66) return false;
+        reg = modrm(d, &rm);
+        uint8_t imm = fetch8(d);
+        fixup_rip(d, &rm);
+        c->rip = dec_rip(d);
+        xrd(c, &rm, &b);
+        for (int i = 0; i < 4; i++) a.d[i] = b.d[(imm >> (2 * i)) & 3];
+        c->xmm[reg] = a;
+        return true;
+    }
+
+    case 0xC2: {                     // cmpps / cmppd / cmpss / cmpsd
+        reg = modrm(d, &rm);
+        uint8_t imm = fetch8(d);
+        fixup_rip(d, &rm);
+        c->rip = dec_rip(d);
+        a = c->xmm[reg];
+        if (d->mand == 0xF2) {                      // scalar double
+            union { uint64_t u; double f; } t;
+            t.u = xrd_lo(c, &rm, 8);
+            a.q[0] = fcmp(imm, a.lf[0], t.f) ? ~0ull : 0;
+        } else if (d->mand == 0xF3) {               // scalar single
+            union { uint32_t u; float f; } t;
+            t.u = (uint32_t)xrd_lo(c, &rm, 4);
+            a.d[0] = fcmp(imm, (double)a.f[0], (double)t.f) ? 0xffffffffu : 0;
+        } else if (d->mand == 0x66) {               // packed double
+            xrd(c, &rm, &b);
+            for (int i = 0; i < 2; i++)
+                a.q[i] = fcmp(imm, a.lf[i], b.lf[i]) ? ~0ull : 0;
+        } else {                                    // packed single
+            xrd(c, &rm, &b);
+            for (int i = 0; i < 4; i++)
+                a.d[i] = fcmp(imm, (double)a.f[i], (double)b.f[i]) ? 0xffffffffu : 0;
+        }
+        c->xmm[reg] = a;
+        return true;
+    }
+
+    case 0xC5: {                     // pextrw
+        if (d->mand != 0x66) return false;
+        reg = modrm(d, &rm);
+        uint8_t imm = fetch8(d);
+        fixup_rip(d, &rm);
+        c->rip = dec_rip(d);
+        if (!rm.is_reg) return false;
+        setreg(c, reg, c->xmm[rm.reg].w[imm & 7], 8);
+        return true;
+    }
+
+    default:
+        return false;
+    }
+    (void)start;
+}
+
 // ------------------------------------------------------------------ core
 static void step(rsd_cpu *c) {
     // 15 bytes is the longest possible x86 instruction.
@@ -360,9 +741,11 @@ static void step(rsd_cpu *c) {
     // --- prefixes ---
     for (;;) {
         uint8_t b = *d.p;
-        if (b == 0x66)      { d.opsize = 2; d.p++; }
+        // 66/F2/F3 are operand-size or rep prefixes for general-purpose
+        // instructions and variant selectors for SSE ones; record both roles.
+        if (b == 0x66)      { d.opsize = 2; d.mand = 0x66; d.p++; }
         else if (b == 0x67) { d.addr32 = true; d.p++; }
-        else if (b == 0xF2 || b == 0xF3) { d.p++; }
+        else if (b == 0xF2 || b == 0xF3) { d.mand = b; d.p++; }
         // In 64-bit mode cs/ds/es/ss overrides are ignored.
         else if (b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26) { d.p++; }
         else if (b == 0x64) { d.seg_base = c->fs_base; d.p++; }
@@ -674,7 +1057,8 @@ static void step(rsd_cpu *c) {
     case 0x0F: {
         uint8_t op2 = fetch8(&d);
 
-        if (op2 == 0x05) { ADVANCE(); do_syscall(c); return; }             // syscall
+        if (op2 == 0x05) { ADVANCE(); do_syscall(c); return; }
+        if (sse_exec(c, &d, op2, start)) return;             // syscall
 
         if (op2 == 0x1E || op2 == 0x1F) { modrm(&d, &rm); fixup_rip(&d, &rm);
                                           ADVANCE(); return; }             // multi-byte nop
@@ -732,7 +1116,11 @@ static void step(rsd_cpu *c) {
         c->fault = "unimplemented 0F opcode";
         c->fault_rip = start;
         c->running = false;
-        fprintf(stderr, "rashid: unimplemented opcode 0f %02x at 0x%llx\n", op2, start);
+        // Print the mandatory prefix too: for 0F opcodes it selects the
+        // instruction, so "0f 58" alone does not identify one.
+        fprintf(stderr, "rashid: unimplemented opcode %s0f %02x at 0x%llx\n",
+                d.mand == 0x66 ? "66 " : d.mand == 0xF2 ? "f2 " :
+                d.mand == 0xF3 ? "f3 " : "", op2, start);
         return;
     }
 

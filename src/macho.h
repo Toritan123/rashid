@@ -46,14 +46,16 @@ typedef struct {
     const char *dylibs[RSD_MAX_DYLIBS];
     int         ndylibs;
 
-    uint64_t    pref_base;  // __TEXT vmaddr
+    uint64_t    pref_base;  // __TEXT vmaddr as linked
+    uint64_t    slide;      // actual placement - pref_base
     uint64_t    entry;      // guest address of entry point
     bool        pie;
     bool        has_main;   // LC_MAIN vs LC_UNIXTHREAD
 } rsd_image;
 
-// Parse an x86_64 Mach-O and map it into the guest address space at its
-// preferred vmaddr - no slide, because guest space is ours to lay out.
+// Parse an x86_64 Mach-O and map it. A PIE image is slid wherever there is
+// room; a non-PIE image must land on its linked address or the load fails,
+// since its code contains absolute references.
 // Returns 0 on success, -1 on failure (message printed to stderr).
 int  rsd_load(rsd_image *img, rsd_as *as, const char *path);
 void rsd_unload(rsd_image *img);

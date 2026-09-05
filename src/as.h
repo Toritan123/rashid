@@ -16,73 +16,62 @@
  */
 // rashid - guest address space
 //
-// The guest gets its own address space, disjoint from rashid's. A guest address
-// is an offset into one big host reservation, so the guest can use its
-// preferred vmaddr (x86_64 images want 0x100000000, which is exactly where
-// rashid's own arm64 image sits) and a wild guest pointer faults cleanly instead
-// of corrupting the translator.
+// The guest shares rashid's address space: a guest pointer *is* a host
+// pointer. That is forced by the thunk design rather than chosen. When
+// translated code calls into a native arm64 framework it hands over pointers,
+// and native code stores pointers into memory the guest later reads - into
+// structs, into ObjC objects, into buffers passed to callbacks. Translating
+// arguments at the boundary would mean chasing whole pointer graphs, so the
+// two sides have to agree on what an address means. Wine and box64 share an
+// address space for the same reason.
 //
-// In the interpreter this costs a bounds check per access. In the JIT (M5) the
-// base becomes a reserved register, which is what FEX and box64 do.
-#ifndef RSD_AS_H
-#define RSD_AS_H
+// What this module tracks is therefore not a separate space but the set of
+// regions rashid has handed to the guest, with their permissions. The
+// interpreter checks accesses against it, which turns a wild guest pointer
+// into a precise report instead of a crash somewhere later. It is a debugging
+// aid, not a sandbox; the JIT will let the host MMU do this work.
+#ifndef RASHID_AS_H
+#define RASHID_AS_H
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-#define RSD_GUEST_PAGE 4096          // x86_64 page granularity
-#define RSD_PROT_R     1
+#define RSD_GUEST_PAGE 4096      // x86_64 page granularity
+#define RSD_PROT_R     1         // matches PROT_READ/WRITE/EXEC
 #define RSD_PROT_W     2
 #define RSD_PROT_X     4
 
 typedef struct {
-    uint8_t *base;      // host address of guest 0
-    uint64_t size;      // guest address space size
-    uint8_t *perm;      // one byte per guest page: RSD_PROT_*
-    uint64_t npages;
+    uint64_t start, end;
+    int      prot;
+} rsd_region;
+
+typedef struct {
+    rsd_region *reg;
+    int         n, cap;
 } rsd_as;
 
-int  rsd_as_init(rsd_as *as, uint64_t size);
+int  rsd_as_init(rsd_as *as);
 void rsd_as_free(rsd_as *as);
 
-// Commit [gaddr, gaddr+len) with the given permissions. Returns 0 on success.
-int  rsd_as_map(rsd_as *as, uint64_t gaddr, uint64_t len, int prot);
+// Map len bytes for the guest. `at` is a preferred address; with `fixed` it
+// is required. Returns the address, or 0 on failure.
+uint64_t rsd_as_map(rsd_as *as, uint64_t at, uint64_t len, int prot, bool fixed);
+int      rsd_as_protect(rsd_as *as, uint64_t at, uint64_t len, int prot);
+int      rsd_as_unmap(rsd_as *as, uint64_t at, uint64_t len);
 
-// Find `len` bytes of free guest space; returns 0 if none.
-uint64_t rsd_as_find(const rsd_as *as, uint64_t len, uint64_t hint);
+// Is [a, a+n) guest memory, and does it allow `prot`?
+bool rsd_as_ok(const rsd_as *as, uint64_t a, uint64_t n, int prot);
+bool rsd_as_mapped(const rsd_as *as, uint64_t a, uint64_t n);
 
-// Human-readable dump of the committed regions.
 void rsd_as_dump(const rsd_as *as);
 
-static inline bool rsd_as_in(const rsd_as *as, uint64_t g, uint64_t n) {
-    return g < as->size && n <= as->size - g;
-}
-
-// Guest -> host. Caller must have checked rsd_as_in().
+// Guest and host addresses are the same thing; this exists to mark the places
+// where a guest address crosses into host code.
 static inline void *rsd_g2h(const rsd_as *as, uint64_t g) {
-    return as->base + g;
-}
-
-// True if [g, g+n) is committed at all, whatever its permissions.
-static inline bool rsd_as_mapped(const rsd_as *as, uint64_t g, uint64_t n) {
-    if (!rsd_as_in(as, g, n))
-        return false;
-    for (uint64_t p = g / RSD_GUEST_PAGE; p <= (g + n - 1) / RSD_GUEST_PAGE; p++)
-        if (!as->perm[p])
-            return false;
-    return true;
-}
-
-// Permission check for [g, g+n). n is small (<= 8) in practice.
-static inline bool rsd_as_ok(const rsd_as *as, uint64_t g, uint64_t n, int prot) {
-    if (!rsd_as_in(as, g, n))
-        return false;
-    uint64_t p0 = g / RSD_GUEST_PAGE, p1 = (g + n - 1) / RSD_GUEST_PAGE;
-    for (uint64_t p = p0; p <= p1; p++)
-        if ((as->perm[p] & prot) != prot)
-            return false;
-    return true;
+    (void)as;
+    return (void *)(uintptr_t)g;
 }
 
 #endif

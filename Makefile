@@ -10,11 +10,14 @@ all: $(BIN)
 $(BIN): $(SRC) src/as.h src/macho.h src/cpu.h
 	$(CC) $(CFLAGS) -o $@ $(SRC)
 
-# Freestanding x86_64 guests: no dylibs, so M0 can run them end to end.
+# Freestanding x86_64 guests. Linked against libSystem so the result is PIE -
+# ld64 forces non-PIE with -static, and a non-PIE image wants 0x100000000,
+# which rashid's own arm64 image already occupies. Nothing is actually
+# imported: these guests reach the kernel through the syscall instruction.
 tests/%.x86: tests/%.c
-	clang -arch x86_64 -nostdlib -static -Wl,-e,_start -O1 -o $@ $<
+	clang -arch x86_64 -nostdlib -lSystem -Wl,-e,_start -O1 -o $@ $<
 
-GUESTS = hello arith tls ripimm sse fault
+GUESTS = hello arith tls ripimm sse vm fault
 
 test: $(BIN) $(GUESTS:%=tests/%.x86)
 	@./tests/run.sh

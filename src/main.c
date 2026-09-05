@@ -48,18 +48,18 @@ int main(int argc, char **argv) {
     if (i >= argc) { usage(); return 2; }
 
     rsd_as as;
-    if (rsd_as_init(&as, 0) < 0) return 1;
+    if (rsd_as_init(&as) < 0) return 1;
 
     rsd_image img;
     if (rsd_load(&img, &as, argv[i]) < 0) return 1;
     rsd_dump(&img);
     if (show_map) { printf("\n"); rsd_as_dump(&as); }
 
-    if (img.ndylibs)
+    if (img.ndylibs && !load_only)
         fprintf(stderr,
-            "\nrashid: image imports %d dylib(s); M0 has no loader/thunk layer yet,\n"
-            "     so execution will fault at the first import. Use -l to inspect.\n",
-            img.ndylibs);
+            "rashid: image links %d dylib(s); there is no loader or thunk layer "
+            "yet, so\n        execution stops at the first imported symbol "
+            "actually called.\n", img.ndylibs);
 
     if (load_only) return 0;
 

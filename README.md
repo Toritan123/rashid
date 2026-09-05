@@ -74,11 +74,10 @@ make test
 ## What works
 
 - x86_64 Mach-O loading — thin and fat, `LC_MAIN` and `LC_UNIXTHREAD`
-- An isolated guest address space. The guest gets the addresses it was linked
-  for, and a wild guest pointer is reported as a fault instead of corrupting
-  the translator.
-- An integer instruction subset: ALU and flags, `jcc`, `call`/`ret`,
-  `mul`/`div`, `movzx`/`movsx`, `cmovcc`, `setcc`, `shld`/`shrd`
+- A shared address space with per-region permission tracking, so a wild guest
+  pointer is reported precisely instead of crashing the translator.
+- An integer instruction subset: ALU with carry (`adc`/`sbb`), flags, `jcc`,
+  `call`/`ret`, `mul`/`div`, `movzx`/`movsx`, `cmovcc`, `setcc`, `shld`/`shrd`
 - **Thread-local storage.** macOS x86_64 keeps a thread's TSD block at `%gs`
   and installs it with the machine-dependent syscall `0x3000003`;
   `pthread_getspecific` is then one instruction, `movq %gs:(,%rdi,8), %rax`.
@@ -86,11 +85,44 @@ make test
 - **SSE**, covering 99.3% of the SIMD instructions compiler-generated x86_64
   code actually executes (see below): 16-byte and scalar moves, bitwise ops,
   scalar and packed float arithmetic, comparisons, conversions.
+- Guest memory management: `mmap` (anonymous), `mprotect`, `munmap`
 - A few macOS syscalls, dispatched by class: `read`, `write`, `close`,
   `exit`, `thread_fast_set_cthread_self`
 
 Not yet: anything that imports a dylib (so: every real application), AVX,
-x87, signals, threads, guest `mmap`.
+x87, signals, threads, file-backed guest `mmap`.
+
+### Address space
+
+**The guest shares rashid's address space: a guest pointer is a host pointer.**
+
+This is forced rather than chosen. When translated code calls into a native
+arm64 framework it hands over pointers, and native code stores pointers into
+memory the guest later reads — into structs, into ObjC objects, into buffers
+passed to callbacks. Converting at the boundary would mean chasing whole
+pointer graphs, so both sides have to agree on what an address means. Wine
+and box64 share an address space for the same reason.
+
+The consequence is that an image cannot always get the address it was linked
+for. x86_64 images want `0x100000000`, which is exactly where an arm64
+executable — rashid itself — is placed, and the linker will not move it:
+`-no_pie` and `-image_base` are ignored on arm64, and `-pagezero_size` caps
+at 4 GB. So PIE images are slid, and a non-PIE image is refused with a clear
+message rather than silently misplaced. Every x86_64 macOS application built
+since roughly 2011 is PIE.
+
+What rashid tracks is the set of regions it has handed to the guest, with
+their permissions. Every access is checked against that list, which turns a
+wild guest pointer into a precise report instead of a crash somewhere later.
+It is a debugging aid, not a sandbox, and it will have to relax once thunks
+exist — at that point the guest legitimately reaches native memory.
+
+Permissions are recorded per region and enforced in software rather than with
+`mprotect`. Apple Silicon uses 16K host pages while x86_64 images are laid
+out on 4K boundaries, so a single host page routinely spans segments with
+different permissions; rounding a protection outward silently makes the
+neighbouring segment unwritable. The JIT will need a real answer here, since
+it cannot afford a check on every access.
 
 ### Which SSE instructions matter
 
@@ -120,22 +152,6 @@ remaining 0.7% is a long tail of 57 SSE3/SSSE3/SSE4.1 opcodes — `pinsrb`,
 with the opcode and its mandatory prefix printed, since for `0F` opcodes the
 prefix is what selects the instruction.
 
-### Guest address space
-
-Guest addresses are offsets into one reservation, not host addresses.
-
-```
-host space                        guest space (8 GiB reserved)
-  0x100000000  rashid's own text    0x100000000  the guest's text
-  0xa58000000  the reservation ───→ 0x000000000  guest zero
-               (ASLR'd; unobservable from inside the guest)
-```
-
-Both can use `0x100000000`, which is what x86_64 images want and also exactly
-where an arm64 executable is placed. This is why non-PIE images work. Every
-access is bounds- and permission-checked; in the JIT the base becomes a
-reserved register, as in FEX and box64.
-
 ## Testing
 
 Guests are freestanding x86_64 binaries that compute something and exit with
@@ -150,6 +166,7 @@ against a live native run of the very same binary.
   tls      rashid=15   native=15   ok
   ripimm   rashid=255  native=255  ok
   sse      rashid=21   native=21   ok
+  vm       rashid=9    native=9    ok
 ```
 
 The live comparison is the valuable one: it checks against the actual CPU
@@ -168,8 +185,8 @@ plausible nearby address instead of faulting.
 |---|---|---|
 | M0 | Mach-O loader + integer interpreter | done |
 | T0 | shared-cache reader (`tools/dsc.py`) | done |
-| M1a | guest address space separation | done |
-| M1b | TLS (`%gs`) — done; guest `mmap` and signals remain | partial |
+| M1a | address space and permission tracking | done |
+| M1b | TLS (`%gs`), guest `mmap` — done; signals remain | partial |
 | M2 | SSE — done; x87 remains | partial |
 | M3 | dyld equivalent: dependency resolution, chained fixups, stub thunking | |
 | **M4** | **generated `objc_msgSend` thunks — first Cocoa application launches** | |

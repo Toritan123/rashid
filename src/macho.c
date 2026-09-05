@@ -144,30 +144,45 @@ int rsd_load(rsd_image *img, rsd_as *as, const char *path) {
         goto fail;
     }
 
-    // --- pass 2: place segments in guest space -------------------------
-    // No slide: the guest address space is ours, so an image gets exactly the
-    // addresses it was linked for. That is what makes non-PIE images work -
-    // rashid's own arm64 code sits at 0x100000000 in the *host* space, which is
-    // where x86_64 images want to be, and the two no longer collide.
+    // --- pass 2: place the image ---------------------------------------
+    // Reserve the whole span in one mapping so the segments keep their
+    // relative layout, then apply each segment's own permissions.
+    uint64_t lo = UINT64_MAX, hi = 0;
+    for (int i = 0; i < img->nsegs; i++) {
+        if (img->segs[i].vmaddr < lo) lo = img->segs[i].vmaddr;
+        uint64_t end = img->segs[i].vmaddr + img->segs[i].vmsize;
+        if (end > hi) hi = end;
+    }
+
+    uint64_t base = rsd_as_map(as, lo, hi - lo, RSD_PROT_R | RSD_PROT_W, !img->pie);
+    if (!base) {
+        if (!img->pie)
+            fprintf(stderr,
+                "rashid: cannot place non-PIE image at its linked address "
+                "0x%llx\n"
+                "        (rashid's own arm64 image occupies that range; only "
+                "PIE images can be slid)\n", lo);
+        else
+            fprintf(stderr, "rashid: cannot reserve 0x%llx bytes for the image\n",
+                    hi - lo);
+        goto fail;
+    }
+    img->slide = base - lo;
+
+    for (int i = 0; i < img->nsegs; i++) {
+        rsd_seg *s = &img->segs[i];
+        if (s->filesize)
+            memcpy(rsd_g2h(as, s->vmaddr + img->slide),
+                   slice + s->fileoff, s->filesize);
+    }
     for (int i = 0; i < img->nsegs; i++) {
         rsd_seg *s = &img->segs[i];
         // initprot bits match RSD_PROT_* (VM_PROT_READ/WRITE/EXECUTE = 1/2/4).
-        int prot = (int)(s->initprot & 7);
-        if (!prot)
-            continue;
-        if (rsd_as_map(as, s->vmaddr, s->vmsize, prot | RSD_PROT_W) < 0)
-            goto fail;
-        if (s->filesize)
-            memcpy(rsd_g2h(as, s->vmaddr), slice + s->fileoff, s->filesize);
-        // Drop write permission again unless the segment really wants it.
-        if (!(prot & RSD_PROT_W)) {
-            for (uint64_t p = s->vmaddr / RSD_GUEST_PAGE;
-                 p <= (s->vmaddr + s->vmsize - 1) / RSD_GUEST_PAGE; p++)
-                as->perm[p] = (uint8_t)prot;
-        }
+        rsd_as_protect(as, s->vmaddr + img->slide, s->vmsize, (int)(s->initprot & 7));
     }
 
-    img->entry = img->has_main ? (img->pref_base + entry_off) : entry_off;
+    img->entry = (img->has_main ? img->pref_base + entry_off : entry_off)
+               + img->slide;
     return 0;
 
 fail:
@@ -186,6 +201,7 @@ void rsd_dump(const rsd_image *img) {
     printf("slice   : +0x%llx  %s  %s\n", img->slice_off,
            img->pie ? "PIE" : "non-PIE",
            img->has_main ? "LC_MAIN" : "LC_UNIXTHREAD");
+    if (img->slide) printf("slide   : 0x%llx\n", img->slide);
     printf("entry   : 0x%llx\n", img->entry);
     printf("segments:\n");
     for (int i = 0; i < img->nsegs; i++) {

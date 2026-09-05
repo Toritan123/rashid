@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <math.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -48,9 +49,8 @@ static void memfault(rsd_cpu *c, uint64_t a, const char *what) {
 // Distinguish "nothing is there" from "there, but not allowed" - the two mean
 // very different things when debugging a guest.
 static const char *why(const rsd_cpu *c, uint64_t a, uint64_t n, const char *act) {
-    if (!rsd_as_in(c->as, a, n))   return "outside guest address space";
-    if (!rsd_as_mapped(c->as, a, n)) return "unmapped guest memory";
     (void)act;
+    if (!rsd_as_mapped(c->as, a, n)) return "not guest memory";
     return "guest memory protection";
 }
 
@@ -155,6 +155,32 @@ static void flags_sub(rsd_cpu *c, uint64_t a, uint64_t b, uint64_t res, int size
     uint64_t sign = 1ull << (size * 8 - 1);
     c->flags &= ~(F_CF | F_OF | F_AF);
     if (a < b) c->flags |= F_CF;
+    if ((a ^ b) & (a ^ r) & sign) c->flags |= F_OF;
+    if ((a ^ b ^ r) & 0x10) c->flags |= F_AF;
+    set_pzs(c, r, size);
+}
+
+// ADC and SBB fold the carry in, which also changes how CF comes out: with a
+// carry in, a result equal to the first operand still means it wrapped.
+static void flags_adc(rsd_cpu *c, uint64_t a, uint64_t b, uint64_t cf,
+                      uint64_t res, int size) {
+    a = trunc_sz(a, size); b = trunc_sz(b, size);
+    uint64_t r = trunc_sz(res, size);
+    uint64_t sign = 1ull << (size * 8 - 1);
+    c->flags &= ~(F_CF | F_OF | F_AF);
+    if (r < a || (cf && r == a)) c->flags |= F_CF;
+    if (~(a ^ b) & (a ^ r) & sign) c->flags |= F_OF;
+    if ((a ^ b ^ r) & 0x10) c->flags |= F_AF;
+    set_pzs(c, r, size);
+}
+
+static void flags_sbb(rsd_cpu *c, uint64_t a, uint64_t b, uint64_t cf,
+                      uint64_t res, int size) {
+    a = trunc_sz(a, size); b = trunc_sz(b, size);
+    uint64_t r = trunc_sz(res, size);
+    uint64_t sign = 1ull << (size * 8 - 1);
+    c->flags &= ~(F_CF | F_OF | F_AF);
+    if (a < b || (cf && a == b)) c->flags |= F_CF;
     if ((a ^ b) & (a ^ r) & sign) c->flags |= F_OF;
     if ((a ^ b ^ r) & 0x10) c->flags |= F_AF;
     set_pzs(c, r, size);
@@ -340,6 +366,31 @@ static void do_syscall(rsd_cpu *c) {
         ret = write((int)a0, rsd_g2h(c->as, a1), (size_t)a2);
         break;
     case 6: ret = close((int)a0); break;
+
+    case 73:  // munmap
+        ret = rsd_as_unmap(c->as, a0, a1);
+        break;
+    case 74:  // mprotect
+        ret = rsd_as_protect(c->as, a0, a1, (int)(a2 & 7));
+        break;
+    case 75:  // madvise - advisory only, nothing to do
+        ret = 0;
+        break;
+    case 197: {  // mmap
+        uint64_t flags = c->r[R10];
+        int fd = (int)c->r[R8];
+        if (!(flags & 0x1000) && fd >= 0) {   // MAP_ANON
+            // File-backed guest mappings are not needed yet: rashid loads
+            // images itself rather than running the guest's dyld.
+            unimplemented_syscall(c, klass, n);
+            return;
+        }
+        uint64_t got = rsd_as_map(c->as, a0, a1, (int)(a2 & 7), (flags & 0x10) != 0);
+        if (!got) { syscall_ret(c, -ENOMEM); return; }
+        c->flags &= ~F_CF;
+        c->r[RAX] = got;
+        return;
+    }
     default:
         unimplemented_syscall(c, klass, n);
         return;
@@ -778,6 +829,8 @@ static void step(rsd_cpu *c) {
     case 0x28: case 0x29: case 0x30: case 0x31: case 0x38: case 0x39:
     case 0x02: case 0x03: case 0x0A: case 0x0B: case 0x22: case 0x23:
     case 0x2A: case 0x2B: case 0x32: case 0x33: case 0x3A: case 0x3B:
+    case 0x10: case 0x11: case 0x12: case 0x13:
+    case 0x18: case 0x19: case 0x1A: case 0x1B:
     case 0x84: case 0x85: case 0x88: case 0x89: case 0x8A: case 0x8B: {
         bool byte = !(op & 1);
         if (op == 0x84) byte = true;
@@ -797,6 +850,12 @@ static void step(rsd_cpu *c) {
 
         switch (op & ~3) {
         case 0x00: r = a + b; flags_add(c, a, b, r, sz); wr(c, dst, r, sz, d.has_rex); break;
+        case 0x10: { uint64_t cf = (c->flags & F_CF) ? 1 : 0;
+                     r = a + b + cf; flags_adc(c, a, b, cf, r, sz);
+                     wr(c, dst, r, sz, d.has_rex); break; }
+        case 0x18: { uint64_t cf = (c->flags & F_CF) ? 1 : 0;
+                     r = a - b - cf; flags_sbb(c, a, b, cf, r, sz);
+                     wr(c, dst, r, sz, d.has_rex); break; }
         case 0x08: r = a | b; flags_logic(c, r, sz);     wr(c, dst, r, sz, d.has_rex); break;
         case 0x20: r = a & b; flags_logic(c, r, sz);     wr(c, dst, r, sz, d.has_rex); break;
         case 0x28: r = a - b; flags_sub(c, a, b, r, sz); wr(c, dst, r, sz, d.has_rex); break;
@@ -812,7 +871,8 @@ static void step(rsd_cpu *c) {
 
     // ---- ALU: op eAX, imm ----
     case 0x04: case 0x05: case 0x0C: case 0x0D: case 0x24: case 0x25:
-    case 0x2C: case 0x2D: case 0x34: case 0x35: case 0x3C: case 0x3D: {
+    case 0x2C: case 0x2D: case 0x34: case 0x35: case 0x3C: case 0x3D:
+    case 0x14: case 0x15: case 0x1C: case 0x1D: {
         bool byte = !(op & 1);
         if (byte) sz = 1;
         uint64_t b = byte ? fetch8(&d) : (uint64_t)(int64_t)(int32_t)fetch32(&d);
@@ -820,6 +880,12 @@ static void step(rsd_cpu *c) {
         uint64_t a = getreg(c, RAX, sz), r;
         switch (op & ~7) {
         case 0x00: r = a + b; flags_add(c, a, b, r, sz); setreg(c, RAX, r, sz); break;
+        case 0x10: { uint64_t cf = (c->flags & F_CF) ? 1 : 0;
+                     r = a + b + cf; flags_adc(c, a, b, cf, r, sz);
+                     setreg(c, RAX, r, sz); break; }
+        case 0x18: { uint64_t cf = (c->flags & F_CF) ? 1 : 0;
+                     r = a - b - cf; flags_sbb(c, a, b, cf, r, sz);
+                     setreg(c, RAX, r, sz); break; }
         case 0x08: r = a | b; flags_logic(c, r, sz);     setreg(c, RAX, r, sz); break;
         case 0x20: r = a & b; flags_logic(c, r, sz);     setreg(c, RAX, r, sz); break;
         case 0x28: r = a - b; flags_sub(c, a, b, r, sz); setreg(c, RAX, r, sz); break;
@@ -889,8 +955,12 @@ static void step(rsd_cpu *c) {
         case 5: r = a - b; flags_sub(c, a, b, r, sz); wr(c, &rm, r, sz, d.has_rex); break;
         case 6: r = a ^ b; flags_logic(c, r, sz);     wr(c, &rm, r, sz, d.has_rex); break;
         case 7: r = a - b; flags_sub(c, a, b, r, sz); break;    // cmp
-        default: c->fault = "grp1 adc/sbb not implemented"; c->fault_rip = start;
-                 c->running = false; return;
+        case 2: { uint64_t cf = (c->flags & F_CF) ? 1 : 0;
+                  r = a + b + cf; flags_adc(c, a, b, cf, r, sz);
+                  wr(c, &rm, r, sz, d.has_rex); break; }
+        default: { uint64_t cf = (c->flags & F_CF) ? 1 : 0;   // 3 = sbb
+                  r = a - b - cf; flags_sbb(c, a, b, cf, r, sz);
+                  wr(c, &rm, r, sz, d.has_rex); break; }
         }
         return;
     }
@@ -1143,12 +1213,10 @@ int rsd_cpu_init(rsd_cpu *c, rsd_as *as, uint64_t entry, int argc, char **argv) 
     c->flags = 0x202;
     c->running = true;
 
-    // Put the stack near the top of guest space, below anything an image is
-    // likely to claim.
-    uint64_t sp_top = as->size - RSD_GUEST_PAGE;
-    uint64_t base = sp_top - GUEST_STACK_SIZE;
-    if (rsd_as_map(as, base, GUEST_STACK_SIZE, RSD_PROT_R | RSD_PROT_W) < 0)
-        return -1;
+    uint64_t base = rsd_as_map(as, 0, GUEST_STACK_SIZE,
+                               RSD_PROT_R | RSD_PROT_W, false);
+    if (!base) { fprintf(stderr, "rashid: cannot allocate guest stack\n"); return -1; }
+    uint64_t sp_top = base + GUEST_STACK_SIZE;
     c->stack_base = base;
     c->stack_size = GUEST_STACK_SIZE;
 

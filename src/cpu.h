@@ -32,7 +32,13 @@ enum { F_CF = 1u << 0, F_PF = 1u << 2, F_AF = 1u << 4,
 typedef struct {
     uint64_t r[16];
     uint64_t rip;
+    uint64_t cur_rip;     // start of the instruction being executed
     uint32_t flags;
+
+    // Segment bases. macOS x86_64 keeps thread-local storage at %gs and never
+    // uses %fs; pthread_getspecific is literally movq %gs:(,%rdi,8), %rax.
+    uint64_t gs_base;
+    uint64_t fs_base;
 
     rsd_as  *as;          // guest address space
     uint64_t stack_base;  // guest address

@@ -37,7 +37,7 @@ static const char *rname[16] = {
 static void memfault(rsd_cpu *c, uint64_t a, const char *what) {
     if (!c->fault) {
         c->fault = what;
-        c->fault_rip = c->rip;
+        c->fault_rip = c->cur_rip;
         c->fault_addr = a;
         c->fault_has_addr = true;
     }
@@ -179,6 +179,7 @@ typedef struct {
     bool     is_reg;
     int      reg;    // register index when is_reg
     uint64_t addr;   // effective address otherwise
+    uint64_t seg;    // segment base to add on access (LEA ignores it)
 } opnd;
 
 typedef struct {
@@ -190,6 +191,7 @@ typedef struct {
     bool     has_rex;
     int      opsize; // 1/2/4/8
     bool     addr32;
+    uint64_t seg_base;
 } dec;
 
 static uint8_t  fetch8 (dec *d) { return *d->p++; }
@@ -210,10 +212,12 @@ static int modrm(dec *d, opnd *rm) {
     if (mod == 3) {
         rm->is_reg = true;
         rm->reg    = rm_bits | ((d->rex & 1) ? 8 : 0);
+        rm->seg    = 0;
         return reg;
     }
 
     rm->is_reg = false;
+    rm->seg    = d->seg_base;
     uint64_t addr = 0;
 
     if (rm_bits == 4) { // SIB
@@ -245,6 +249,8 @@ static int modrm(dec *d, opnd *rm) {
 }
 
 // Resolve a pending RIP-relative operand once the instruction length is known.
+// Call this only after every immediate has been fetched: the displacement is
+// measured from the end of the entire instruction, immediates included.
 static void fixup_rip(dec *d, opnd *rm) {
     if (!rm->is_reg && rm->reg == -1)
         rm->addr = dec_rip(d) + (int64_t)(int32_t)rm->addr;
@@ -253,25 +259,67 @@ static void fixup_rip(dec *d, opnd *rm) {
 static uint64_t rd(rsd_cpu *c, const opnd *o, int size, bool has_rex) {
     if (o->is_reg) return size == 1 ? getreg8(c, o->reg, has_rex)
                                     : getreg(c, o->reg, size);
-    return ld(c, o->addr, size);
+    return ld(c, o->addr + o->seg, size);
 }
 static void wr(rsd_cpu *c, const opnd *o, uint64_t v, int size, bool has_rex) {
     if (o->is_reg) { if (size == 1) setreg8(c, o->reg, v, has_rex);
                      else           setreg(c, o->reg, v, size); return; }
-    st(c, o->addr, v, size);
+    st(c, o->addr + o->seg, v, size);
 }
 
 static void push(rsd_cpu *c, uint64_t v) { c->r[RSP] -= 8; st(c, c->r[RSP], v, 8); }
 static uint64_t pop(rsd_cpu *c) { uint64_t v = ld(c, c->r[RSP], 8); c->r[RSP] += 8; return v; }
 
 // --------------------------------------------------------------- syscall
-// macOS x86_64: BSD syscalls carry class 2 in the high bits of rax; args in
-// rdi/rsi/rdx/r10/r8/r9; errors are signalled by CF with errno in rax.
-static void do_syscall(rsd_cpu *c) {
-    uint64_t n = c->r[RAX] & 0xffffff;
-    uint64_t a0 = c->r[RDI], a1 = c->r[RSI], a2 = c->r[RDX];
-    int64_t ret = -1;
+// macOS encodes the syscall class in the high byte of the number: 1 = Mach
+// trap, 2 = BSD, 3 = machine-dependent. Args are in rdi/rsi/rdx/r10/r8/r9,
+// and errors come back as CF set with errno in rax.
+#define SYSCALL_CLASS(n)  (((n) >> 24) & 0xff)
+#define SYSCALL_NUMBER(n) ((n) & 0xffffff)
+#define CLASS_MACH 1
+#define CLASS_BSD  2
+#define CLASS_MDEP 3
 
+static void syscall_ret(rsd_cpu *c, int64_t ret) {
+    if (ret < 0) { c->flags |= F_CF;  c->r[RAX] = (uint64_t)(-ret); }
+    else         { c->flags &= ~F_CF; c->r[RAX] = (uint64_t)ret; }
+}
+
+static void unimplemented_syscall(rsd_cpu *c, uint64_t klass, uint64_t n) {
+    static const char *names[] = { "?", "mach", "bsd", "mdep" };
+    c->fault = "unimplemented syscall";
+    c->fault_rip = c->rip;
+    c->running = false;
+    fprintf(stderr, "rashid: unimplemented %s syscall %llu (rax=0x%llx) at 0x%llx\n",
+            klass < 4 ? names[klass] : "?", n, c->r[RAX], c->rip);
+}
+
+static void do_syscall(rsd_cpu *c) {
+    uint64_t klass = SYSCALL_CLASS(c->r[RAX]);
+    uint64_t n     = SYSCALL_NUMBER(c->r[RAX]);
+    uint64_t a0 = c->r[RDI], a1 = c->r[RSI], a2 = c->r[RDX];
+
+    if (klass == CLASS_MDEP) {
+        switch (n) {
+        case 3:  // thread_fast_set_cthread_self: rdi is the new %gs base.
+                 // This is how a thread's TSD block is installed; everything
+                 // from pthread_getspecific to malloc's per-thread caches
+                 // reads through it.
+            c->gs_base = a0;
+            syscall_ret(c, 0);
+            return;
+        default:
+            unimplemented_syscall(c, klass, n);
+            return;
+        }
+    }
+
+    if (klass != CLASS_BSD) {
+        unimplemented_syscall(c, klass, n);
+        return;
+    }
+
+    int64_t ret;
     switch (n) {
     case 1: // exit
         c->running = false;
@@ -291,15 +339,10 @@ static void do_syscall(rsd_cpu *c) {
         break;
     case 6: ret = close((int)a0); break;
     default:
-        c->fault = "unimplemented syscall";
-        c->fault_rip = c->rip;
-        c->running = false;
-        fprintf(stderr, "rashid: unimplemented syscall %llu at 0x%llx\n", n, c->rip);
+        unimplemented_syscall(c, klass, n);
         return;
     }
-
-    if (ret < 0) { c->flags |= F_CF; c->r[RAX] = (uint64_t)(-ret); }
-    else         { c->flags &= ~F_CF; c->r[RAX] = (uint64_t)ret; }
+    syscall_ret(c, ret);
 }
 
 // ------------------------------------------------------------------ core
@@ -312,6 +355,7 @@ static void step(rsd_cpu *c) {
     uint8_t *host = rsd_g2h(c->as, c->rip);
     dec d = { .c = c, .p = host, .p0 = host, .rip0 = c->rip, .opsize = 4 };
     uint64_t start = c->rip;
+    c->cur_rip = start;   // ADVANCE() moves c->rip early, so faults use this
 
     // --- prefixes ---
     for (;;) {
@@ -319,11 +363,10 @@ static void step(rsd_cpu *c) {
         if (b == 0x66)      { d.opsize = 2; d.p++; }
         else if (b == 0x67) { d.addr32 = true; d.p++; }
         else if (b == 0xF2 || b == 0xF3) { d.p++; }
+        // In 64-bit mode cs/ds/es/ss overrides are ignored.
         else if (b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26) { d.p++; }
-        else if (b == 0x64 || b == 0x65) {
-            c->fault = "segment-override (TLS access) not implemented";
-            c->fault_rip = start; c->running = false; return;
-        }
+        else if (b == 0x64) { d.seg_base = c->fs_base; d.p++; }
+        else if (b == 0x65) { d.seg_base = c->gs_base; d.p++; }
         else break;
     }
     if ((*d.p & 0xF0) == 0x40) {
@@ -426,9 +469,9 @@ static void step(rsd_cpu *c) {
 
     case 0x69: case 0x6B: { // imul r, r/m, imm
         reg = modrm(&d, &rm);
-        uint64_t imm;
-        if (op == 0x6B) { fixup_rip(&d, &rm); imm = (uint64_t)(int64_t)(int8_t)fetch8(&d); }
-        else            { fixup_rip(&d, &rm); imm = (uint64_t)(int64_t)(int32_t)fetch32(&d); }
+        uint64_t imm = (op == 0x6B) ? (uint64_t)(int64_t)(int8_t)fetch8(&d)
+                                    : (uint64_t)(int64_t)(int32_t)fetch32(&d);
+        fixup_rip(&d, &rm);
         ADVANCE();
         int64_t r = sext(rd(c, &rm, sz, d.has_rex), sz) * (int64_t)imm;
         setreg(c, reg, (uint64_t)r, sz);
@@ -451,9 +494,9 @@ static void step(rsd_cpu *c) {
         if (op == 0x80) sz = 1;
         int ext = modrm(&d, &rm);
         ext &= 7;
-        uint64_t b;
-        if (op == 0x81) { fixup_rip(&d, &rm); b = (uint64_t)(int64_t)(int32_t)fetch32(&d); }
-        else            { fixup_rip(&d, &rm); b = (uint64_t)(int64_t)(int8_t)fetch8(&d); }
+        uint64_t b = (op == 0x81) ? (uint64_t)(int64_t)(int32_t)fetch32(&d)
+                                  : (uint64_t)(int64_t)(int8_t)fetch8(&d);
+        fixup_rip(&d, &rm);
         ADVANCE();
         uint64_t a = rd(c, &rm, sz, d.has_rex), r;
         switch (ext) {
@@ -518,11 +561,11 @@ static void step(rsd_cpu *c) {
     case 0xC0: case 0xC1: case 0xD0: case 0xD1: case 0xD2: case 0xD3: {
         if (op == 0xC0 || op == 0xD0 || op == 0xD2) sz = 1;
         int ext = modrm(&d, &rm) & 7;
-        fixup_rip(&d, &rm);
         uint64_t cnt;
         if (op == 0xC0 || op == 0xC1)      cnt = fetch8(&d);
         else if (op == 0xD0 || op == 0xD1) cnt = 1;
         else                               cnt = c->r[RCX] & 0xff;
+        fixup_rip(&d, &rm);
         ADVANCE();
         cnt &= (sz == 8) ? 63 : 31;
         if (!cnt) return;
@@ -545,9 +588,9 @@ static void step(rsd_cpu *c) {
     case 0xC6: case 0xC7: { // mov r/m, imm
         if (op == 0xC6) sz = 1;
         modrm(&d, &rm);
-        uint64_t v;
-        if (op == 0xC6) { fixup_rip(&d, &rm); v = fetch8(&d); }
-        else            { fixup_rip(&d, &rm); v = (uint64_t)(int64_t)(int32_t)fetch32(&d); }
+        uint64_t v = (op == 0xC6) ? (uint64_t)fetch8(&d)
+                                  : (uint64_t)(int64_t)(int32_t)fetch32(&d);
+        fixup_rip(&d, &rm);
         ADVANCE();
         wr(c, &rm, v, sz, d.has_rex);
         return;
@@ -568,10 +611,10 @@ static void step(rsd_cpu *c) {
     case 0xF6: case 0xF7: {
         if (op == 0xF6) sz = 1;
         int ext = modrm(&d, &rm) & 7;
-        fixup_rip(&d, &rm);
         uint64_t imm = 0;
         if (ext == 0 || ext == 1) imm = (op == 0xF6) ? fetch8(&d)
                                                      : (uint64_t)(int64_t)(int32_t)fetch32(&d);
+        fixup_rip(&d, &rm);
         ADVANCE();
         uint64_t a = rd(c, &rm, sz, d.has_rex);
         switch (ext) {
@@ -653,10 +696,11 @@ static void step(rsd_cpu *c) {
         }
         if (op2 == 0xA4 || op2 == 0xA5 || op2 == 0xAC || op2 == 0xAD) {    // shld/shrd
             bool left = (op2 < 0xAC);
-            reg = modrm(&d, &rm); fixup_rip(&d, &rm);
+            reg = modrm(&d, &rm);
             uint64_t cnt;
             if (op2 == 0xA4 || op2 == 0xAC) cnt = fetch8(&d);
             else                            cnt = c->r[RCX] & 0xff;
+            fixup_rip(&d, &rm);
             ADVANCE();
             int w = sz * 8;
             cnt &= (sz == 8) ? 63 : 31;

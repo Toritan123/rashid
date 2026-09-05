@@ -79,10 +79,15 @@ make test
   the translator.
 - An integer instruction subset: ALU and flags, `jcc`, `call`/`ret`,
   `mul`/`div`, `movzx`/`movsx`, `cmovcc`, `setcc`, `shld`/`shrd`
-- A few macOS BSD syscalls: `read`, `write`, `close`, `exit`
+- **Thread-local storage.** macOS x86_64 keeps a thread's TSD block at `%gs`
+  and installs it with the machine-dependent syscall `0x3000003`;
+  `pthread_getspecific` is then one instruction, `movq %gs:(,%rdi,8), %rax`.
+  (`%fs` is never used on macOS — zero occurrences across all of libsystem.)
+- A few macOS syscalls, dispatched by class: `read`, `write`, `close`,
+  `exit`, `thread_fast_set_cthread_self`
 
 Not yet: anything that imports a dylib (so: every real application), SSE/AVX,
-x87, TLS (`%fs`), signals, threads, guest `mmap`.
+x87, signals, threads, guest `mmap`.
 
 ### Guest address space
 
@@ -100,6 +105,31 @@ where an arm64 executable is placed. This is why non-PIE images work. Every
 access is bounds- and permission-checked; in the JIT the base becomes a
 reserved register, as in FEX and box64.
 
+## Testing
+
+Guests are freestanding x86_64 binaries that compute something and exit with
+the answer. `make test` checks that answer twice: against a value recorded
+from real x86_64 hardware, and — while Rosetta still exists on this machine —
+against a live native run of the very same binary.
+
+```
+== behaviour (exit status must match real x86_64) ==
+  hello    rashid=0    native=0    ok
+  arith    rashid=55   native=55   ok
+  tls      rashid=15   native=15   ok
+  ripimm   rashid=255  native=255  ok
+```
+
+The live comparison is the valuable one: it checks against the actual CPU
+rather than against our belief about it. It also disappears in macOS 28,
+which is the reason this project exists — so record expected values now.
+
+It has already earned its keep. `tests/ripimm.x86` covers a bug where a
+RIP-relative displacement combined with an immediate operand resolved four
+bytes early, because the displacement is measured from the end of the
+*entire* instruction, immediates included. Every affected access landed on a
+plausible nearby address instead of faulting.
+
 ## Roadmap
 
 | | | |
@@ -107,7 +137,7 @@ reserved register, as in FEX and box64.
 | M0 | Mach-O loader + integer interpreter | done |
 | T0 | shared-cache reader (`tools/dsc.py`) | done |
 | M1a | guest address space separation | done |
-| M1b | guest `mmap`, TLS (`%fs`), signals | |
+| M1b | TLS (`%gs`) — done; guest `mmap` and signals remain | partial |
 | M2 | SSE2 and x87 | |
 | M3 | dyld equivalent: dependency resolution, chained fixups, stub thunking | |
 | **M4** | **generated `objc_msgSend` thunks — first Cocoa application launches** | |

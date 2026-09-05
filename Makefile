@@ -14,15 +14,11 @@ $(BIN): $(SRC) src/as.h src/macho.h src/cpu.h
 tests/%.x86: tests/%.c
 	clang -arch x86_64 -nostdlib -static -Wl,-e,_start -O1 -o $@ $<
 
-test: $(BIN) tests/hello.x86 tests/arith.x86 tests/fault.x86
-	@echo "=== hello ==="   && ./$(BIN) tests/hello.x86
-	@echo "=== arith ==="   && ./$(BIN) tests/arith.x86; \
-	  echo "(expected exit status 55)"
-	@echo "=== fault containment ==="; \
-	  for m in null w f; do \
-	    printf '  %-5s ' $$m; \
-	    ./$(BIN) tests/fault.x86 $$m 2>&1 | grep -m1 '^fault:' || echo "NO FAULT REPORTED"; \
-	  done
+GUESTS = hello arith tls ripimm fault
+
+test: $(BIN) $(GUESTS:%=tests/%.x86)
+	@./tests/run.sh
 
 clean:
 	rm -f $(BIN) tests/*.x86
+	rm -rf *.dSYM

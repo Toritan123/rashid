@@ -27,12 +27,32 @@
 
 #define RSD_STUB_STRIDE 16
 
+// A variadic function rashid knows how to forward. macOS arm64 puts every
+// variadic argument on the stack, while System V puts the first few in
+// registers, so the two cannot be bridged without knowing how many arguments
+// there are and what they are - which for these functions means reading the
+// format string.
+typedef struct {
+    int  nfixed;   // arguments before the ellipsis
+    int  fmt;      // which of them is the format string
+    bool scan;     // scanf family: every conversion consumes a pointer
+} rsd_vaspec;
+
+const rsd_vaspec *rsd_variadic_spec(const char *symbol);
+
 typedef struct {
     uint64_t     base;      // guest address of stub 0
     int          n;
     const char **names;     // symbol name per stub
     const char **libs;      // library it was imported from
+    void       **fns;       // native arm64 implementation, or NULL
+    const rsd_vaspec **va;  // non-NULL where the function is variadic
 } rsd_stubs;
+
+// The call gate, implemented in callgate.S: enter a native arm64 function
+// with a chosen register and stack state, capturing both return registers.
+uint64_t rsd_call_native(void *fn, const uint64_t x[8], const double d[8],
+                         const void *stack, uint64_t stackbytes, double *ret_d);
 
 // Which import does this address belong to, or -1.
 static inline int rsd_stub_index(const rsd_stubs *s, uint64_t addr) {

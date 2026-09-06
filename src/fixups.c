@@ -81,8 +81,13 @@ static void walk_chain(rsd_image *img, rsd_as *as, uint64_t addr,
             memcpy(&b, &raw, sizeof b);
             next = (uint32_t)b.next;
             if ((int)b.ordinal < img->nimports) {
-                *loc = stub_base + (uint64_t)b.ordinal * RSD_STUB_STRIDE + b.addend;
-                img->imports[b.ordinal].used = true;
+                rsd_import *im = &img->imports[b.ordinal];
+                im->used = true;
+                // Data goes straight to the native address; code has to go
+                // through a stub so the calling convention can be converted.
+                *loc = (im->native && !im->is_code)
+                     ? (uint64_t)(uintptr_t)im->native + b.addend
+                     : stub_base + (uint64_t)b.ordinal * RSD_STUB_STRIDE + b.addend;
             } else {
                 *loc = 0;
             }
@@ -114,6 +119,7 @@ int rsd_fixups(rsd_image *img, rsd_as *as) {
         return -1;
     }
     if (parse_imports(img, chain, h) < 0) return -1;
+    rsd_resolve_imports(img);
 
     // One executable stub per import, so an unresolved call lands somewhere
     // rashid can name rather than at address zero.
@@ -157,8 +163,13 @@ void rsd_stubs_of(const rsd_image *img, rsd_stubs *out) {
     out->names = calloc((size_t)img->nimports, sizeof(char *));
     out->libs  = calloc((size_t)img->nimports, sizeof(char *));
     if (!out->names || !out->libs) { out->n = 0; return; }
+    out->fns = calloc((size_t)img->nimports, sizeof(void *));
+    out->va  = calloc((size_t)img->nimports, sizeof(rsd_vaspec *));
+    if (!out->fns || !out->va) { out->n = 0; return; }
     for (int i = 0; i < img->nimports; i++) {
         out->names[i] = img->imports[i].name;
         out->libs[i]  = img->imports[i].lib;
+        out->fns[i]   = img->imports[i].is_code ? img->imports[i].native : NULL;
+        out->va[i]    = rsd_variadic_spec(img->imports[i].name);
     }
 }

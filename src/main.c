@@ -57,25 +57,31 @@ int main(int argc, char **argv) {
 
     rsd_stubs stubs;
     rsd_stubs_of(&img, &stubs);
-    if (show_map) { printf("\n"); rsd_as_dump(&as); }
+    if (show_map) { fprintf(stderr, "\n"); rsd_as_dump(&as); }
 
-    if (img.nimports && !load_only)
-        fprintf(stderr,
-            "rashid: %d import(s) have no thunk yet; execution will stop at the "
-            "first one called.\n", img.nimports);
+    if (!load_only) {
+        int unresolved = 0;
+        for (int k = 0; k < img.nimports; k++)
+            if (!img.imports[k].native) unresolved++;
+        if (unresolved)
+            fprintf(stderr,
+                "rashid: %d of %d import(s) could not be resolved; execution "
+                "stops if one is called.\n", unresolved, img.nimports);
+    }
 
     if (load_only) return 0;
 
-    printf("\n-- executing --\n");
+    fprintf(stderr, "-- executing --\n");
     rsd_cpu cpu;
-    if (rsd_cpu_init(&cpu, &as, img.entry, argc - i, argv + i) < 0) return 1;
+    if (rsd_cpu_init(&cpu, &as, img.entry, img.has_main, argc - i, argv + i) < 0)
+        return 1;
     cpu.stubs = &stubs;
     cpu.trace = trace;
     rsd_cpu_run(&cpu, budget);
 
     if (cpu.fault) { rsd_cpu_dump(&cpu); rsd_cpu_free(&cpu); return 1; }
 
-    printf("-- guest exited with status %d after %llu instructions --\n",
+    fprintf(stderr, "-- guest exited with status %d after %llu instructions --\n",
            cpu.exit_code, cpu.icount);
     rsd_cpu_free(&cpu);
     return cpu.exit_code;

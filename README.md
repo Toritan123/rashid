@@ -87,22 +87,51 @@ make test
   scalar and packed float arithmetic, comparisons, conversions.
 - Guest memory management: `mmap` (anonymous), `mprotect`, `munmap`
 - **Dynamic loading.** `LC_DYLD_CHAINED_FIXUPS` is walked, the image rebased,
-  and every import bound. Real application binaries load and run until they
-  call something that needs a thunk, at which point rashid names the symbol
-  and the library it came from.
+  and every import resolved against the native arm64 frameworks already
+  loaded in the process.
+- **Thunks for C functions.** Translated code calls into native arm64
+  libSystem and gets correct answers back, including variadic calls.
 - A few macOS syscalls, dispatched by class: `read`, `write`, `close`,
   `exit`, `thread_fast_set_cthread_self`
 
-Not yet: the thunks themselves, so no import can actually be called. Also
-AVX, x87, signals, threads, file-backed guest `mmap`.
+Not yet: Objective-C message sends, so no Cocoa application runs. Also AVX,
+x87, signals, threads, file-backed guest `mmap`.
+
+A normally linked x86_64 binary runs to completion, producing byte-identical
+output to the same binary run natively:
 
 ```
-$ rashid hello.x86
-fault: call into an import that has no thunk yet
-       _printf  (from libSystem.B.dylib)
+$ ./native.x86                                $ rashid native.x86
+running through native arm64 libSystem        running through native arm64 libSystem
+all native calls returned correctly           all native calls returned correctly
+exit 14                                       exit 14
 ```
 
-### How much is left for the first application
+### Crossing the ABI boundary
+
+The two integer conventions line up almost exactly — System V's `rdi, rsi,
+rdx, rcx, r8, r9` become AAPCS64's `x0..x5`, and floating-point arguments sit
+in `xmm0-7` on one side and `v0-v7` on the other. A small assembly call gate
+enters the native function with a chosen register and stack state and
+captures both `x0` and `d0`, since which return register matters depends on a
+signature rashid may not know.
+
+Whether an imported symbol is code or data decides how it is bound. A
+function has to go through a stub, because binding it directly would leave
+the guest trying to execute arm64 instructions as x86. A data symbol — an
+Objective-C class object, a CoreFoundation constant — is never called, only
+dereferenced, so it binds straight to the native address. Rather than guess
+from the name, rashid looks the symbol up in its own image and asks whether
+the containing segment is executable.
+
+Variadic calls need real work. **macOS arm64 passes every variadic argument
+on the stack**, while System V passes the first few in registers, so
+forwarding one means knowing how many arguments there are and what they are.
+For the formatted-IO family that comes from the format string, which rashid
+parses to rebuild the call. Other variadic functions are a known gap: without
+signatures they would be handed their arguments in registers and misbehave.
+
+### How much is left for the first application### How much is left for the first application
 
 A Cocoa "hello world" — `NSString`, `NSLog`, an autorelease pool — imports
 eight symbols:
@@ -200,8 +229,9 @@ against a live native run of the very same binary.
   sse      rashid=21   native=21   ok
   vm       rashid=9    native=9    ok
 
-== dynamic loading (chained fixups, imports bound to named stubs) ==
-  import   stopped at _printf after 8 instructions of real app code
+== native thunks (real binaries running through arm64 libSystem) ==
+  native   output and exit status match native (14)
+  varargs  output and exit status match native (0)
 ```
 
 The live comparison is the valuable one: it checks against the actual CPU
@@ -223,8 +253,8 @@ plausible nearby address instead of faulting.
 | M1a | address space and permission tracking | done |
 | M1b | TLS (`%gs`), guest `mmap` — done; signals remain | partial |
 | M2 | SSE — done; x87 remains | partial |
-| M3 | chained fixups and binding — done; loading real dylibs remains | partial |
-| **M4** | **generated `objc_msgSend` thunks — first Cocoa application launches** | |
+| M3 | chained fixups, binding, C thunks — done | done |
+| **M4** | **generated `objc_msgSend` thunks — first Cocoa application launches** | next |
 | M5 | basic-block JIT (`MAP_JIT` + `pthread_jit_write_protect_np`) | |
 | M6 | AOT cache, trace JIT | |
 

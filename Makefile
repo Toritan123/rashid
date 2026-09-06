@@ -1,6 +1,6 @@
 CC      ?= clang
 CFLAGS  ?= -O2 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -arch arm64
-SRC      = src/as.c src/macho.c src/fixups.c src/cpu.c src/main.c
+SRC      = src/as.c src/macho.c src/fixups.c src/thunk.c src/cpu.c src/main.c src/callgate.S
 BIN      = rashid
 
 .PHONY: all clean test
@@ -18,7 +18,7 @@ tests/%.x86: tests/%.c
 	clang -arch x86_64 -nostdlib -lSystem -Wl,-e,_start -O1 -o $@ $<
 
 GUESTS = hello arith tls ripimm sse vm fault
-EXTRA  = tests/import.x86
+EXTRA  = tests/import.x86 tests/native.x86 tests/varargs.x86
 
 test: $(BIN) $(GUESTS:%=tests/%.x86) $(EXTRA)
 	@./tests/run.sh
@@ -29,4 +29,10 @@ clean:
 
 # Normally linked, so it carries chained fixups and real imports.
 tests/import.x86: tests/import.c
+	clang -arch x86_64 -O1 -o $@ $<
+
+tests/native.x86: tests/native.c
+	clang -arch x86_64 -O1 -o $@ $<
+
+tests/varargs.x86: tests/varargs.c
 	clang -arch x86_64 -O1 -o $@ $<

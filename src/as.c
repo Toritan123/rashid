@@ -168,9 +168,9 @@ bool rsd_as_ok(const rsd_as *as, uint64_t a, uint64_t n, int prot) {
 }
 
 void rsd_as_dump(const rsd_as *as) {
-    printf("guest regions (%d):\n", as->n);
+    fprintf(stderr, "guest regions (%d):\n", as->n);
     for (int i = 0; i < as->n; i++)
-        printf("  0x%011llx-0x%011llx  %c%c%c\n",
+        fprintf(stderr, "  0x%011llx-0x%011llx  %c%c%c\n",
                as->reg[i].start, as->reg[i].end,
                (as->reg[i].prot & RSD_PROT_R) ? 'r' : '-',
                (as->reg[i].prot & RSD_PROT_W) ? 'w' : '-',

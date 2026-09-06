@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # Differential test harness.
 #
 # Every guest is a freestanding x86_64 binary that computes something and
@@ -55,15 +55,31 @@ for mode in null w f; do
 done
 
 echo
-echo "== dynamic loading (chained fixups, imports bound to named stubs) =="
-out=$("$BIN" tests/import.x86 2>&1)
-ran=$(printf '%s' "$out" | sed -n 's/.*guest state (\([0-9]*\) instructions).*/\1/p')
+echo "== native thunks (real binaries running through arm64 libSystem) =="
+compare() {
+    name=$1
+    n_out=$("tests/$name.x86" 2>/dev/null); n=$?
+    r_out=$("$BIN" "tests/$name.x86" 2>/dev/null); r=$?
+    if [ "$n_out" = "$r_out" ] && [ "$n" = "$r" ]; then
+        printf '  %-8s output and exit status match native (%s)\n' "$name" "$n"
+    else
+        printf '  %-8s FAIL: native=%s rashid=%s\n' "$name" "$n" "$r"
+        diff <(printf '%s\n' "$n_out") <(printf '%s\n' "$r_out") | head -6
+        fail=1
+    fi
+}
+compare native
+compare varargs
+
+echo
+echo "== dynamic loading (chained fixups walked, imports resolved) =="
+out=$("$BIN" -l tests/import.x86 2>&1)
 case $out in
-    *_printf*) printf '  %-8s stopped at _printf after %s instructions of real app code\n' \
-                      import "${ran:-?}" ;;
-    *)         printf '  %-8s FAIL: expected to stop at _printf\n' import
-               printf '%s\n' "$out" | tail -3
-               fail=1 ;;
+    *"_printf"*"libSystem"*"thunk"*)
+        printf '  %-8s _printf bound and resolved to a native thunk\n' import ;;
+    *)  printf '  %-8s FAIL: _printf not reported as a resolved thunk\n' import
+        printf '%s\n' "$out" | tail -4
+        fail=1 ;;
 esac
 
 echo

@@ -39,7 +39,9 @@ typedef struct {
     const char *name;   // imported symbol
     const char *lib;    // library it comes from
     bool        weak;
-    bool        used;   // something in the image actually binds to it
+    bool        used;      // something in the image actually binds to it
+    void       *native;    // arm64 implementation, or NULL
+    bool        is_code;   // call it through a thunk; data binds directly
 } rsd_import;
 
 typedef struct {
@@ -78,5 +80,8 @@ void rsd_dump(const rsd_image *img);
 // stub. rashid is the dynamic linker here - the guest's dyld never runs.
 int  rsd_fixups(rsd_image *img, rsd_as *as);
 void rsd_stubs_of(const rsd_image *img, rsd_stubs *out);
+
+// Look each import up in the native arm64 frameworks already loaded here.
+void rsd_resolve_imports(rsd_image *img);
 
 #endif

@@ -46,16 +46,32 @@ static void memfault(rsd_cpu *c, uint64_t a, const char *what) {
     c->running = false;
 }
 
-// Distinguish "nothing is there" from "there, but not allowed" - the two mean
-// very different things when debugging a guest.
+// Once imports are thunked, the guest legitimately holds addresses rashid
+// never handed out: what malloc returned, objects the frameworks created,
+// strings inside a dylib. Those have to be readable and writable, so data
+// accesses outside the tracked regions are allowed through to the host MMU
+// and only the clearly impossible are refused.
+//
+// Execution stays strict. The guest must never run off into native arm64
+// code, which it would try to decode as x86.
+#define RSD_MIN_VALID 0x1000ull                 // the null page
+#define RSD_MAX_VALID 0x0001000000000000ull     // beyond any user address
+
+static bool access_ok(const rsd_cpu *c, uint64_t a, uint64_t n, int prot) {
+    if (rsd_as_ok(c->as, a, n, prot)) return true;
+    if (rsd_as_mapped(c->as, a, n)) return false;   // ours, but not permitted
+    return a >= RSD_MIN_VALID && n <= RSD_MAX_VALID - a;
+}
+
 static const char *why(const rsd_cpu *c, uint64_t a, uint64_t n, const char *act) {
     (void)act;
-    if (!rsd_as_mapped(c->as, a, n)) return "not guest memory";
-    return "guest memory protection";
+    if (rsd_as_mapped(c->as, a, n)) return "guest memory protection";
+    if (a < RSD_MIN_VALID) return "null pointer";
+    return "not a usable address";
 }
 
 static uint64_t ld(rsd_cpu *c, uint64_t a, int size) {
-    if (!rsd_as_ok(c->as, a, (uint64_t)size, RSD_PROT_R)) {
+    if (!access_ok(c, a, (uint64_t)size, RSD_PROT_R)) {
         memfault(c, a, why(c, a, (uint64_t)size, "read"));
         return 0;
     }
@@ -69,7 +85,7 @@ static uint64_t ld(rsd_cpu *c, uint64_t a, int size) {
 }
 
 static void st(rsd_cpu *c, uint64_t a, uint64_t v, int size) {
-    if (!rsd_as_ok(c->as, a, (uint64_t)size, RSD_PROT_W)) {
+    if (!access_ok(c, a, (uint64_t)size, RSD_PROT_W)) {
         memfault(c, a, why(c, a, (uint64_t)size, "write"));
         return;
     }
@@ -354,14 +370,14 @@ static void do_syscall(rsd_cpu *c) {
         c->exit_code = (int)a0;
         return;
     case 3:
-        if (!rsd_as_ok(c->as, a1, a2, RSD_PROT_W)) {
-            memfault(c, a1, "read() buffer not writable in guest space"); return;
+        if (!access_ok(c, a1, a2, RSD_PROT_W)) {
+            memfault(c, a1, "read() buffer is not writable"); return;
         }
         ret = read((int)a0, rsd_g2h(c->as, a1), (size_t)a2);
         break;
     case 4:
-        if (!rsd_as_ok(c->as, a1, a2, RSD_PROT_R)) {
-            memfault(c, a1, "write() buffer not readable in guest space"); return;
+        if (!access_ok(c, a1, a2, RSD_PROT_R)) {
+            memfault(c, a1, "write() buffer is not readable"); return;
         }
         ret = write((int)a0, rsd_g2h(c->as, a1), (size_t)a2);
         break;
@@ -399,6 +415,127 @@ static void do_syscall(rsd_cpu *c) {
 }
 
 
+// ----------------------------------------------------------------- thunks
+// Enter a native arm64 function on the guest's behalf. The two integer
+// conventions line up almost exactly - System V's rdi, rsi, rdx, rcx, r8, r9
+// become AAPCS64's x0..x5 - and floating-point arguments sit in xmm0-7 on one
+// side and v0-v7 on the other.
+//
+// This generic form covers a function taking at most six integer and eight
+// floating-point arguments and returning a scalar. It does not yet cover
+// arguments passed on the stack, structs passed or returned by value, or
+// variadic functions, which on macOS arm64 take every variadic argument on
+// the stack rather than in registers.
+static void call_native(rsd_cpu *c, void *fn) {
+    uint64_t x[8] = { c->r[RDI], c->r[RSI], c->r[RDX],
+                      c->r[RCX], c->r[R8],  c->r[R9], 0, 0 };
+    double d[8];
+    for (int i = 0; i < 8; i++) d[i] = c->xmm[i].lf[0];
+
+    double rd = 0;
+    uint64_t rx = rsd_call_native(fn, x, d, NULL, 0, &rd);
+
+    // rax and xmm0 are both caller-saved, so setting the one the callee did
+    // not use cannot be observed by correct guest code.
+    c->r[RAX] = rx;
+    c->xmm[0].lf[0] = rd;
+    c->rip = pop(c);
+}
+
+// Reading arguments back out of the layout System V put them in: integers
+// fill rdi, rsi, rdx, rcx, r8, r9 and floating-point values fill xmm0-7,
+// each sequence independently, and whatever does not fit goes on the stack in
+// declaration order.
+typedef struct {
+    rsd_cpu *c;
+    int      gp, sse;
+    uint64_t stack;
+} sysv_reader;
+
+static uint64_t sysv_int(sysv_reader *a) {
+    static const int order[6] = { RDI, RSI, RDX, RCX, R8, R9 };
+    if (a->gp < 6) return a->c->r[order[a->gp++]];
+    uint64_t v = ld(a->c, a->stack, 8);
+    a->stack += 8;
+    return v;
+}
+
+static uint64_t sysv_sse(sysv_reader *a) {
+    if (a->sse < 8) return a->c->xmm[a->sse++].q[0];
+    uint64_t v = ld(a->c, a->stack, 8);
+    a->stack += 8;
+    return v;
+}
+
+// Walk a format string, collecting one 8-byte slot per variadic argument.
+// Returns the number of slots, or -1 for something that cannot be forwarded.
+static int marshal_format(rsd_cpu *c, uint64_t fmt, bool scan,
+                          sysv_reader *a, uint64_t *slots, int max) {
+    int n = 0;
+    uint64_t p = fmt;
+    for (;;) {
+        uint64_t ch = ld(c, p++, 1);
+        if (!c->running) return -1;
+        if (!ch) break;
+        if (ch != '%') continue;
+
+        bool star = false, long_double = false;
+        uint64_t conv = 0;
+        for (;;) {
+            ch = ld(c, p++, 1);
+            if (!c->running || !ch) break;
+            if (ch == '*') { star = true; continue; }
+            if (ch == 'L') { long_double = true; continue; }
+            if (strchr("diouxXcspnfFeEgGaA%", (int)ch)) { conv = ch; break; }
+            // flags, field width, precision and length modifiers: skipped,
+            // since none of them changes how many arguments are consumed.
+        }
+        if (!conv || conv == '%') continue;
+        if (long_double) return -1;          // 80-bit x87, not supported
+
+        // In printf a * takes an extra width argument; in scanf it means the
+        // conversion is not assigned anywhere and takes none.
+        if (star) {
+            if (scan) continue;
+            if (n >= max) return -1;
+            slots[n++] = sysv_int(a);
+        }
+        if (n >= max) return -1;
+        bool fp = !scan && strchr("fFeEgGaA", (int)conv) != NULL;
+        slots[n++] = fp ? sysv_sse(a) : sysv_int(a);
+    }
+    return n;
+}
+
+// macOS arm64 passes every variadic argument on the stack, one 8-byte slot
+// each, while System V passes the first few in registers. Bridging the two
+// means knowing how many arguments there are, which the format string says.
+static void call_native_variadic(rsd_cpu *c, void *fn, const rsd_vaspec *sp) {
+    sysv_reader a = { c, 0, 0, c->r[RSP] + 8 };   // past the return address
+
+    uint64_t x[8] = { 0 };
+    double   d[8] = { 0 };
+    for (int i = 0; i < sp->nfixed && i < 8; i++)
+        x[i] = sysv_int(&a);
+
+    uint64_t slots[64];
+    int n = marshal_format(c, x[sp->fmt], sp->scan, &a, slots, 64);
+    if (n < 0) {
+        if (!c->fault) {
+            c->fault = "cannot forward this variadic call";
+            c->fault_rip = c->cur_rip;
+            c->running = false;
+        }
+        return;
+    }
+
+    double rd = 0;
+    uint64_t rx = rsd_call_native(fn, x, d, slots, (uint64_t)n * 8, &rd);
+    c->r[RAX] = rx;
+    c->xmm[0].lf[0] = rd;
+    c->rip = pop(c);
+}
+
 // ------------------------------------------------------------------- SSE
 // Measured against compiler-generated x86_64 code, SIMD use is overwhelmingly
 // 16-byte moves and scalar double arithmetic - movups and movaps alone are
@@ -411,7 +548,7 @@ static void do_syscall(rsd_cpu *c) {
 //   F3   = scalar single, F2 = scalar double.
 
 static void ld128(rsd_cpu *c, uint64_t a, rsd_xmm *o) {
-    if (!rsd_as_ok(c->as, a, 16, RSD_PROT_R)) {
+    if (!access_ok(c, a, 16, RSD_PROT_R)) {
         memfault(c, a, why(c, a, 16, "read"));
         memset(o, 0, sizeof *o);
         return;
@@ -420,7 +557,7 @@ static void ld128(rsd_cpu *c, uint64_t a, rsd_xmm *o) {
 }
 
 static void st128(rsd_cpu *c, uint64_t a, const rsd_xmm *v) {
-    if (!rsd_as_ok(c->as, a, 16, RSD_PROT_W)) {
+    if (!access_ok(c, a, 16, RSD_PROT_W)) {
         memfault(c, a, why(c, a, 16, "write"));
         return;
     }
@@ -779,17 +916,31 @@ static bool sse_exec(rsd_cpu *c, dec *d, uint8_t op2, uint64_t start) {
 
 // ------------------------------------------------------------------ core
 static void step(rsd_cpu *c) {
-    // 15 bytes is the longest possible x86 instruction.
-    if (!rsd_as_ok(c->as, c->rip, 1, RSD_PROT_X)) {
-        memfault(c, c->rip, why(c, c->rip, 1, "execute"));
+    // These two land on addresses that are deliberately not ordinary guest
+    // code, so they are recognised before the executable-memory check.
+    if (c->rip == RSD_RETURN_MAGIC) {          // main() returned
+        c->running = false;
+        c->exit_code = (int)(c->r[RAX] & 0xff);
         return;
     }
+
     int imp = rsd_stub_index(c->stubs, c->rip);
+    if (imp >= 0 && c->stubs->fns && c->stubs->fns[imp]) {
+        const rsd_vaspec *sp = c->stubs->va ? c->stubs->va[imp] : NULL;
+        if (sp) call_native_variadic(c, c->stubs->fns[imp], sp);
+        else    call_native(c, c->stubs->fns[imp]);
+        return;
+    }
     if (imp >= 0) {
         c->fault = "call into an import that has no thunk yet";
         c->fault_rip = c->rip;
         c->fault_import = imp;
         c->running = false;
+        return;
+    }
+
+    if (!rsd_as_ok(c->as, c->rip, 1, RSD_PROT_X)) {
+        memfault(c, c->rip, why(c, c->rip, 1, "execute"));
         return;
     }
 
@@ -1215,7 +1366,8 @@ static void step(rsd_cpu *c) {
 }
 
 // ------------------------------------------------------------------- API
-int rsd_cpu_init(rsd_cpu *c, rsd_as *as, uint64_t entry, int argc, char **argv) {
+int rsd_cpu_init(rsd_cpu *c, rsd_as *as, uint64_t entry, bool has_main,
+                 int argc, char **argv) {
     memset(c, 0, sizeof *c);
     c->as = as;
     c->fault_import = -1;
@@ -1226,15 +1378,12 @@ int rsd_cpu_init(rsd_cpu *c, rsd_as *as, uint64_t entry, int argc, char **argv) 
     uint64_t base = rsd_as_map(as, 0, GUEST_STACK_SIZE,
                                RSD_PROT_R | RSD_PROT_W, false);
     if (!base) { fprintf(stderr, "rashid: cannot allocate guest stack\n"); return -1; }
-    uint64_t sp_top = base + GUEST_STACK_SIZE;
     c->stack_base = base;
     c->stack_size = GUEST_STACK_SIZE;
 
-    // Minimal macOS start frame: argc, argv[], NULL, envp NULL, apple NULL.
-    // argv strings are copied into guest space; the guest cannot see host
-    // pointers.
-    uint64_t strp = sp_top - RSD_GUEST_PAGE;
-    uint64_t sp = base + GUEST_STACK_SIZE / 2;
+    // argv strings live in guest memory: the guest must never see a host
+    // pointer it did not get from us.
+    uint64_t strp = base + GUEST_STACK_SIZE;
     uint64_t gargv[64];
     if (argc > 60) argc = 60;
     for (int i = 0; i < argc; i++) {
@@ -1243,13 +1392,40 @@ int rsd_cpu_init(rsd_cpu *c, rsd_as *as, uint64_t entry, int argc, char **argv) 
         memcpy(rsd_g2h(as, strp), argv[i], n);
         gargv[i] = strp;
     }
-    uint64_t *f = rsd_g2h(as, sp);
-    int n = 0;
-    f[n++] = (uint64_t)argc;
-    for (int i = 0; i < argc; i++) f[n++] = gargv[i];
-    f[n++] = 0;   // argv terminator
-    f[n++] = 0;   // envp terminator
-    f[n++] = 0;   // apple[] terminator
+    strp &= ~15ull;
+
+    // argv[], then an empty envp and the empty "apple" vector dyld passes.
+    uint64_t vec = (strp - (uint64_t)(argc + 3) * 8) & ~15ull;
+    uint64_t *v = rsd_g2h(as, vec);
+    for (int i = 0; i < argc; i++) v[i] = gargv[i];
+    v[argc] = 0;
+    v[argc + 1] = 0;
+    v[argc + 2] = 0;
+
+    uint64_t sp = (vec - 4096) & ~15ull;
+
+    if (has_main) {
+        // LC_MAIN images start at main() itself, called the way dyld calls
+        // it. The return address is a sentinel so that main returning is
+        // recognised rather than jumping into nothing.
+        c->r[RDI] = (uint64_t)argc;
+        c->r[RSI] = vec;
+        c->r[RDX] = vec + (uint64_t)(argc + 1) * 8;
+        c->r[RCX] = vec + (uint64_t)(argc + 2) * 8;
+        sp -= 8;
+        st(c, sp, RSD_RETURN_MAGIC, 8);
+    } else {
+        // LC_UNIXTHREAD images start at _start, which reads argc and argv off
+        // the stack itself.
+        sp = (sp - (uint64_t)(argc + 4) * 8) & ~15ull;
+        uint64_t *f = rsd_g2h(as, sp);
+        int n = 0;
+        f[n++] = (uint64_t)argc;
+        for (int i = 0; i < argc; i++) f[n++] = gargv[i];
+        f[n++] = 0;
+        f[n++] = 0;
+        f[n++] = 0;
+    }
     c->r[RSP] = sp;
     return 0;
 }

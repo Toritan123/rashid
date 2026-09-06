@@ -71,7 +71,12 @@ typedef struct {
     bool        fault_has_addr;
 } rsd_cpu;
 
-int  rsd_cpu_init(rsd_cpu *c, rsd_as *as, uint64_t entry, int argc, char **argv);
+// Where main() returns to. Not a valid guest address, so landing on it can
+// only mean the program finished.
+#define RSD_RETURN_MAGIC 0xfffffffffffff000ull
+
+int  rsd_cpu_init(rsd_cpu *c, rsd_as *as, uint64_t entry, bool has_main,
+                  int argc, char **argv);
 void rsd_cpu_free(rsd_cpu *c);
 
 // Execute up to `budget` instructions (0 = unlimited). Returns when the

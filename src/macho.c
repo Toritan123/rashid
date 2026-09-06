@@ -205,32 +205,38 @@ void rsd_unload(rsd_image *img) {
 }
 
 void rsd_dump(const rsd_image *img) {
-    printf("image   : %s\n", img->path);
-    printf("slice   : +0x%llx  %s  %s\n", img->slice_off,
+    fprintf(stderr, "image   : %s\n", img->path);
+    fprintf(stderr, "slice   : +0x%llx  %s  %s\n", img->slice_off,
            img->pie ? "PIE" : "non-PIE",
            img->has_main ? "LC_MAIN" : "LC_UNIXTHREAD");
-    if (img->slide) printf("slide   : 0x%llx\n", img->slide);
-    printf("entry   : 0x%llx\n", img->entry);
-    printf("segments:\n");
+    if (img->slide) fprintf(stderr, "slide   : 0x%llx\n", img->slide);
+    fprintf(stderr, "entry   : 0x%llx\n", img->entry);
+    fprintf(stderr, "segments:\n");
     for (int i = 0; i < img->nsegs; i++) {
         const rsd_seg *s = &img->segs[i];
-        printf("  %-12s vm 0x%011llx+0x%-8llx  file 0x%08llx+0x%-8llx  %c%c%c\n",
+        fprintf(stderr, "  %-12s vm 0x%011llx+0x%-8llx  file 0x%08llx+0x%-8llx  %c%c%c\n",
                s->name, s->vmaddr, s->vmsize, s->fileoff, s->filesize,
                (s->initprot & 1) ? 'r' : '-',
                (s->initprot & 2) ? 'w' : '-',
                (s->initprot & 4) ? 'x' : '-');
     }
     if (img->ndylibs) {
-        printf("dylibs  : (%d)\n", img->ndylibs);
+        fprintf(stderr, "dylibs  : (%d)\n", img->ndylibs);
         for (int i = 0; i < img->ndylibs; i++)
-            printf("  %s\n", img->dylibs[i]);
+            fprintf(stderr, "  %s\n", img->dylibs[i]);
     } else {
-        printf("dylibs  : none (freestanding)\n");
+        fprintf(stderr, "dylibs  : none (freestanding)\n");
     }
     if (img->nimports) {
-        printf("imports : (%d) -- each needs a thunk\n", img->nimports);
+        int unresolved = 0;
         for (int i = 0; i < img->nimports; i++)
-            printf("  %-46s %s%s\n", img->imports[i].name, img->imports[i].lib,
-                   img->imports[i].weak ? "  (weak)" : "");
+            if (!img->imports[i].native) unresolved++;
+        fprintf(stderr, "imports : (%d, %d unresolved)\n", img->nimports, unresolved);
+        for (int i = 0; i < img->nimports; i++) {
+            const rsd_import *im = &img->imports[i];
+            fprintf(stderr, "  %-46s %-24s %s%s\n", im->name, im->lib,
+                   !im->native ? "UNRESOLVED" : im->is_code ? "thunk" : "data",
+                   im->weak ? "  (weak)" : "");
+        }
     }
 }

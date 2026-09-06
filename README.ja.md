@@ -56,19 +56,45 @@ PrivateFramework については、その x86_64 版を丸ごと翻訳して動�
 - **SSE**。コンパイラ生成コードが実行する SIMD 命令の 99.3% をカバー (下記)
 - ゲストのメモリ管理: `mmap` (匿名)、`mprotect`、`munmap`
 - **動的ロード**。`LC_DYLD_CHAINED_FIXUPS` を辿り、イメージを rebase し、
-  全 import を bind する。実物のアプリがロードされ実行され、thunk が必要な
-  ものを呼んだ時点で、そのシンボル名と由来ライブラリを報告して停止する
+  同一プロセスに既にロードされているネイティブ arm64 フレームワークに対して
+  全 import を解決する
+- **C 関数の thunk**。翻訳されたコードがネイティブ arm64 の libSystem を
+  呼び、正しい結果を受け取る。可変長引数を含む
 - クラス判定付きの syscall: `read` / `write` / `close` / `exit` /
   `thread_fast_set_cthread_self`
 
-動かないもの: thunk 本体。したがって import は1つも呼べない。
-他に AVX、x87、シグナル、スレッド、ファイル実体を伴う `mmap`。
+動かないもの: Objective-C のメッセージ送信。したがって Cocoa アプリは
+まだ動かない。他に AVX、x87、シグナル、スレッド、ファイル実体を伴う `mmap`。
+
+通常リンクされた x86_64 バイナリが最後まで動き、実機と1バイト違わぬ出力を出す。
 
 ```
-$ rashid hello.x86
-fault: call into an import that has no thunk yet
-       _printf  (from libSystem.B.dylib)
+$ ./native.x86                              $ rashid native.x86
+running through native arm64 libSystem      running through native arm64 libSystem
+all native calls returned correctly         all native calls returned correctly
+exit 14                                     exit 14
 ```
+
+### ABI 境界を越える
+
+整数の規約はほぼ一致している。System V の `rdi, rsi, rdx, rcx, r8, r9` が
+AAPCS64 の `x0..x5` になり、浮動小数点は片方が `xmm0-7`、もう片方が
+`v0-v7`。小さなアセンブリの呼び出しゲートが、選んだレジスタとスタック状態で
+ネイティブ関数に入り、`x0` と `d0` の両方を回収する。どちらの返り値レジスタが
+意味を持つかは、rashid が知らないかもしれないシグネチャ次第だからである。
+
+import されたシンボルがコードかデータかで bind 方法が変わる。関数は stub を
+経由させねばならない。直接 bind するとゲストが arm64 命令を x86 として
+実行しようとするため。データ — Objective-C のクラスオブジェクト、
+CoreFoundation の定数 — は呼ばれず参照されるだけなので、ネイティブアドレスに
+直接 bind する。名前から推測するのではなく、シンボルを自身のイメージ内で
+引いて、含まれるセグメントが実行可能かで判定する。
+
+可変長引数は本当の作業を要する。**macOS arm64 は可変長引数を全てスタックで
+渡す**が、System V は最初の数個をレジスタで渡す。転送するには引数の個数と
+型を知る必要があり、書式付き入出力の一群についてはそれが書式文字列から
+分かるので、rashid は書式を解析して呼び出しを組み直す。それ以外の可変長
+関数は既知の欠落である。シグネチャなしではレジスタで渡してしまい誤動作する。
 
 ### 最初の1本まであとどれくらいか
 
@@ -163,7 +189,7 @@ rashid が追跡するのは、ゲストに渡した領域とその権限。全�
 | M1a | アドレス空間と権限追跡 | **完了** |
 | M1b | TLS (`%gs`)・`mmap` 完了。シグナルが残り | 一部 |
 | M2 | SSE 完了。x87 が残り | 一部 |
-| M3 | chained fixups と bind 完了。実 dylib のロードが残り | 一部 |
+| M3 | chained fixups・bind・C thunk | **完了** |
 | M4 | `objc_msgSend` thunk の自動生成 → 最初の Cocoa アプリ起動 | |
 | M5 | basic-block JIT (MAP_JIT + `pthread_jit_write_protect_np`) | |
 | M6 | AOT キャッシュ、trace JIT | |

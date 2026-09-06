@@ -29,15 +29,8 @@ static long sys3(long n, long a, long b, long c) {
     return ret;
 }
 
-void start(void) {
-    long argc;
-    __asm__ volatile("movq (%%rsp), %0" : "=r"(argc));
-    char mode = 0;
-    if (argc > 1) {
-        char **argv;
-        __asm__ volatile("leaq 8(%%rsp), %0" : "=r"(argv));
-        mode = argv[1][0];
-    }
+int start(int argc, char **argv) {
+    char mode = (argc > 1) ? argv[1][0] : 0;
 
     if (mode == 'w') {
         *(volatile long *)start = 0;              // write to read-only __TEXT

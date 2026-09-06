@@ -784,6 +784,15 @@ static void step(rsd_cpu *c) {
         memfault(c, c->rip, why(c, c->rip, 1, "execute"));
         return;
     }
+    int imp = rsd_stub_index(c->stubs, c->rip);
+    if (imp >= 0) {
+        c->fault = "call into an import that has no thunk yet";
+        c->fault_rip = c->rip;
+        c->fault_import = imp;
+        c->running = false;
+        return;
+    }
+
     uint8_t *host = rsd_g2h(c->as, c->rip);
     dec d = { .c = c, .p = host, .p0 = host, .rip0 = c->rip, .opsize = 4 };
     uint64_t start = c->rip;
@@ -1209,6 +1218,7 @@ static void step(rsd_cpu *c) {
 int rsd_cpu_init(rsd_cpu *c, rsd_as *as, uint64_t entry, int argc, char **argv) {
     memset(c, 0, sizeof *c);
     c->as = as;
+    c->fault_import = -1;
     c->rip = entry;
     c->flags = 0x202;
     c->running = true;
@@ -1272,6 +1282,11 @@ void rsd_cpu_dump(const rsd_cpu *c) {
     fprintf(stderr, "rip =%016llx  flags=%08x [%s%s%s%s]\n", c->rip, c->flags,
             (c->flags & F_CF) ? "C" : "-", (c->flags & F_ZF) ? "Z" : "-",
             (c->flags & F_SF) ? "S" : "-", (c->flags & F_OF) ? "O" : "-");
+    if (c->fault && c->fault_import >= 0 && c->stubs) {
+        fprintf(stderr, "fault: %s\n       %s  (from %s)\n", c->fault,
+                c->stubs->names[c->fault_import], c->stubs->libs[c->fault_import]);
+        return;
+    }
     if (c->fault) {
         fprintf(stderr, "fault: %s @ rip 0x%llx", c->fault, c->fault_rip);
         if (c->fault_has_addr) fprintf(stderr, " (addr 0x%llx)", c->fault_addr);

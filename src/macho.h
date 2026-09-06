@@ -23,6 +23,7 @@
 #include <stddef.h>
 
 #include "as.h"
+#include "stubs.h"
 
 #define RSD_MAX_SEGS   16
 #define RSD_MAX_DYLIBS 128
@@ -33,6 +34,13 @@ typedef struct {
     uint64_t fileoff, filesize;
     uint32_t initprot, maxprot;
 } rsd_seg;
+
+typedef struct {
+    const char *name;   // imported symbol
+    const char *lib;    // library it comes from
+    bool        weak;
+    bool        used;   // something in the image actually binds to it
+} rsd_import;
 
 typedef struct {
     const char *path;
@@ -51,6 +59,11 @@ typedef struct {
     uint64_t    entry;      // guest address of entry point
     bool        pie;
     bool        has_main;   // LC_MAIN vs LC_UNIXTHREAD
+
+    uint32_t     fixups_off, fixups_size;   // LC_DYLD_CHAINED_FIXUPS
+    rsd_import  *imports;
+    int          nimports;
+    uint64_t     stub_base;
 } rsd_image;
 
 // Parse an x86_64 Mach-O and map it. A PIE image is slid wherever there is
@@ -60,5 +73,10 @@ typedef struct {
 int  rsd_load(rsd_image *img, rsd_as *as, const char *path);
 void rsd_unload(rsd_image *img);
 void rsd_dump(const rsd_image *img);
+
+// Apply LC_DYLD_CHAINED_FIXUPS: rebase the image and bind every import to a
+// stub. rashid is the dynamic linker here - the guest's dyld never runs.
+int  rsd_fixups(rsd_image *img, rsd_as *as);
+void rsd_stubs_of(const rsd_image *img, rsd_stubs *out);
 
 #endif

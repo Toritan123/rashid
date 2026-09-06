@@ -1,13 +1,13 @@
 CC      ?= clang
 CFLAGS  ?= -O2 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -arch arm64
-SRC      = src/as.c src/macho.c src/cpu.c src/main.c
+SRC      = src/as.c src/macho.c src/fixups.c src/cpu.c src/main.c
 BIN      = rashid
 
 .PHONY: all clean test
 
 all: $(BIN)
 
-$(BIN): $(SRC) src/as.h src/macho.h src/cpu.h
+$(BIN): $(SRC) src/as.h src/macho.h src/cpu.h src/stubs.h
 	$(CC) $(CFLAGS) -o $@ $(SRC)
 
 # Freestanding x86_64 guests. Linked against libSystem so the result is PIE -
@@ -18,10 +18,15 @@ tests/%.x86: tests/%.c
 	clang -arch x86_64 -nostdlib -lSystem -Wl,-e,_start -O1 -o $@ $<
 
 GUESTS = hello arith tls ripimm sse vm fault
+EXTRA  = tests/import.x86
 
-test: $(BIN) $(GUESTS:%=tests/%.x86)
+test: $(BIN) $(GUESTS:%=tests/%.x86) $(EXTRA)
 	@./tests/run.sh
 
 clean:
 	rm -f $(BIN) tests/*.x86
 	rm -rf *.dSYM
+
+# Normally linked, so it carries chained fixups and real imports.
+tests/import.x86: tests/import.c
+	clang -arch x86_64 -O1 -o $@ $<

@@ -52,20 +52,24 @@ int main(int argc, char **argv) {
 
     rsd_image img;
     if (rsd_load(&img, &as, argv[i]) < 0) return 1;
+    if (rsd_fixups(&img, &as) < 0) return 1;
     rsd_dump(&img);
+
+    rsd_stubs stubs;
+    rsd_stubs_of(&img, &stubs);
     if (show_map) { printf("\n"); rsd_as_dump(&as); }
 
-    if (img.ndylibs && !load_only)
+    if (img.nimports && !load_only)
         fprintf(stderr,
-            "rashid: image links %d dylib(s); there is no loader or thunk layer "
-            "yet, so\n        execution stops at the first imported symbol "
-            "actually called.\n", img.ndylibs);
+            "rashid: %d import(s) have no thunk yet; execution will stop at the "
+            "first one called.\n", img.nimports);
 
     if (load_only) return 0;
 
     printf("\n-- executing --\n");
     rsd_cpu cpu;
     if (rsd_cpu_init(&cpu, &as, img.entry, argc - i, argv + i) < 0) return 1;
+    cpu.stubs = &stubs;
     cpu.trace = trace;
     rsd_cpu_run(&cpu, budget);
 

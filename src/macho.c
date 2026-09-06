@@ -125,6 +125,12 @@ int rsd_load(rsd_image *img, rsd_as *as, const char *path) {
             img->has_main = false;
             break;
         }
+        case LC_DYLD_CHAINED_FIXUPS: {
+            const struct linkedit_data_command *ld = (const void *)lc;
+            img->fixups_off  = ld->dataoff;
+            img->fixups_size = ld->datasize;
+            break;
+        }
         case LC_LOAD_DYLIB:
         case LC_LOAD_WEAK_DYLIB:
         case LC_REEXPORT_DYLIB: {
@@ -194,6 +200,8 @@ void rsd_unload(rsd_image *img) {
     if (img->file && img->file != MAP_FAILED)
         munmap(img->file, img->filesz);
     img->file = NULL;
+    free(img->imports);
+    img->imports = NULL;
 }
 
 void rsd_dump(const rsd_image *img) {
@@ -213,10 +221,16 @@ void rsd_dump(const rsd_image *img) {
                (s->initprot & 4) ? 'x' : '-');
     }
     if (img->ndylibs) {
-        printf("dylibs  : (%d) -- these are the thunk targets\n", img->ndylibs);
+        printf("dylibs  : (%d)\n", img->ndylibs);
         for (int i = 0; i < img->ndylibs; i++)
             printf("  %s\n", img->dylibs[i]);
     } else {
         printf("dylibs  : none (freestanding)\n");
+    }
+    if (img->nimports) {
+        printf("imports : (%d) -- each needs a thunk\n", img->nimports);
+        for (int i = 0; i < img->nimports; i++)
+            printf("  %-46s %s%s\n", img->imports[i].name, img->imports[i].lib,
+                   img->imports[i].weak ? "  (weak)" : "");
     }
 }

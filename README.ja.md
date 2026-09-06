@@ -55,11 +55,42 @@ PrivateFramework については、その x86_64 版を丸ごと翻訳して動�
   `movq %gs:(,%rdi,8), %rax` の1命令 (`%fs` は macOS では未使用)
 - **SSE**。コンパイラ生成コードが実行する SIMD 命令の 99.3% をカバー (下記)
 - ゲストのメモリ管理: `mmap` (匿名)、`mprotect`、`munmap`
+- **動的ロード**。`LC_DYLD_CHAINED_FIXUPS` を辿り、イメージを rebase し、
+  全 import を bind する。実物のアプリがロードされ実行され、thunk が必要な
+  ものを呼んだ時点で、そのシンボル名と由来ライブラリを報告して停止する
 - クラス判定付きの syscall: `read` / `write` / `close` / `exit` /
   `thread_fast_set_cthread_self`
 
-動かないもの: dylib を import するバイナリ全部 (= 実アプリ全部)。
-AVX、x87、シグナル、スレッド、ファイル実体を伴う `mmap`。
+動かないもの: thunk 本体。したがって import は1つも呼べない。
+他に AVX、x87、シグナル、スレッド、ファイル実体を伴う `mmap`。
+
+```
+$ rashid hello.x86
+fault: call into an import that has no thunk yet
+       _printf  (from libSystem.B.dylib)
+```
+
+### 最初の1本まであとどれくらいか
+
+Cocoa の hello world (`NSString`、`NSLog`、autorelease pool) が import する
+シンボルは **8個**:
+
+```
+_NSLog                                Foundation
+_OBJC_CLASS_$_NSString                Foundation
+_objc_autoreleasePoolPop              libobjc
+_objc_autoreleasePoolPush             libobjc
+_objc_msgSend                         libobjc
+_objc_release                         libobjc
+_objc_retainAutoreleasedReturnValue   libobjc
+___CFConstantStringClassReference     CoreFoundation
+```
+
+これが最初のマイルストーンの実際の大きさ。先に数えた C 関数 32,444 個は
+最終的な表面積であって入場料ではない。アプリが触るのはその小さな、そして
+大部分が共通の部分集合にすぎない。8個のうち6個は Objective-C ランタイムの
+入口であり、`objc_msgSend` を**通った先**は手書きではなく生成された thunk
+が担う。
 
 ```
 make             # ビルド
@@ -132,7 +163,7 @@ rashid が追跡するのは、ゲストに渡した領域とその権限。全�
 | M1a | アドレス空間と権限追跡 | **完了** |
 | M1b | TLS (`%gs`)・`mmap` 完了。シグナルが残り | 一部 |
 | M2 | SSE 完了。x87 が残り | 一部 |
-| M3 | dyld 相当: 依存解決、chained fixups、stub の thunk 化 | |
+| M3 | chained fixups と bind 完了。実 dylib のロードが残り | 一部 |
 | M4 | `objc_msgSend` thunk の自動生成 → 最初の Cocoa アプリ起動 | |
 | M5 | basic-block JIT (MAP_JIT + `pthread_jit_write_protect_np`) | |
 | M6 | AOT キャッシュ、trace JIT | |

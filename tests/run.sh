@@ -55,6 +55,18 @@ for mode in null w f; do
 done
 
 echo
+echo "== dynamic loading (chained fixups, imports bound to named stubs) =="
+out=$("$BIN" tests/import.x86 2>&1)
+ran=$(printf '%s' "$out" | sed -n 's/.*guest state (\([0-9]*\) instructions).*/\1/p')
+case $out in
+    *_printf*) printf '  %-8s stopped at _printf after %s instructions of real app code\n' \
+                      import "${ran:-?}" ;;
+    *)         printf '  %-8s FAIL: expected to stop at _printf\n' import
+               printf '%s\n' "$out" | tail -3
+               fail=1 ;;
+esac
+
+echo
 [ "$native_seen" = 1 ] || echo "note: no native x86_64 execution available; recorded values only"
 if [ "$fail" = 0 ]; then echo "all tests passed"; else echo "FAILURES"; fi
 exit $fail

@@ -86,11 +86,43 @@ make test
   code actually executes (see below): 16-byte and scalar moves, bitwise ops,
   scalar and packed float arithmetic, comparisons, conversions.
 - Guest memory management: `mmap` (anonymous), `mprotect`, `munmap`
+- **Dynamic loading.** `LC_DYLD_CHAINED_FIXUPS` is walked, the image rebased,
+  and every import bound. Real application binaries load and run until they
+  call something that needs a thunk, at which point rashid names the symbol
+  and the library it came from.
 - A few macOS syscalls, dispatched by class: `read`, `write`, `close`,
   `exit`, `thread_fast_set_cthread_self`
 
-Not yet: anything that imports a dylib (so: every real application), AVX,
-x87, signals, threads, file-backed guest `mmap`.
+Not yet: the thunks themselves, so no import can actually be called. Also
+AVX, x87, signals, threads, file-backed guest `mmap`.
+
+```
+$ rashid hello.x86
+fault: call into an import that has no thunk yet
+       _printf  (from libSystem.B.dylib)
+```
+
+### How much is left for the first application
+
+A Cocoa "hello world" — `NSString`, `NSLog`, an autorelease pool — imports
+eight symbols:
+
+```
+_NSLog                                Foundation
+_OBJC_CLASS_$_NSString                Foundation
+_objc_autoreleasePoolPop              libobjc
+_objc_autoreleasePoolPush             libobjc
+_objc_msgSend                         libobjc
+_objc_release                         libobjc
+_objc_retainAutoreleasedReturnValue   libobjc
+___CFConstantStringClassReference     CoreFoundation
+```
+
+That is the real size of the first milestone. The 32,444 C entry points
+counted earlier are the eventual surface, not the entry price: an application
+touches a small, and largely shared, subset of it. Six of these eight are
+Objective-C runtime entry points, and everything reached *through*
+`objc_msgSend` is covered by generated thunks rather than hand-written ones.
 
 ### Address space
 
@@ -167,6 +199,9 @@ against a live native run of the very same binary.
   ripimm   rashid=255  native=255  ok
   sse      rashid=21   native=21   ok
   vm       rashid=9    native=9    ok
+
+== dynamic loading (chained fixups, imports bound to named stubs) ==
+  import   stopped at _printf after 8 instructions of real app code
 ```
 
 The live comparison is the valuable one: it checks against the actual CPU
@@ -188,7 +223,7 @@ plausible nearby address instead of faulting.
 | M1a | address space and permission tracking | done |
 | M1b | TLS (`%gs`), guest `mmap` — done; signals remain | partial |
 | M2 | SSE — done; x87 remains | partial |
-| M3 | dyld equivalent: dependency resolution, chained fixups, stub thunking | |
+| M3 | chained fixups and binding — done; loading real dylibs remains | partial |
 | **M4** | **generated `objc_msgSend` thunks — first Cocoa application launches** | |
 | M5 | basic-block JIT (`MAP_JIT` + `pthread_jit_write_protect_np`) | |
 | M6 | AOT cache, trace JIT | |

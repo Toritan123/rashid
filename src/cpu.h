@@ -22,6 +22,7 @@
 #include <stdbool.h>
 
 #include "as.h"
+#include "stubs.h"
 
 enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI,
        R8,  R9,  R10, R11, R12, R13, R14, R15 };
@@ -54,6 +55,7 @@ typedef struct {
     uint64_t fs_base;
 
     rsd_as  *as;          // guest address space
+    const rsd_stubs *stubs;   // imports with no thunk yet
     uint64_t stack_base;  // guest address
     uint64_t stack_size;
 
@@ -63,6 +65,7 @@ typedef struct {
     bool     trace;
 
     const char *fault;    // set when execution aborts
+    int         fault_import; // index into stubs, or -1
     uint64_t    fault_rip;
     uint64_t    fault_addr;
     bool        fault_has_addr;

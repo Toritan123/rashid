@@ -26,6 +26,7 @@
 #include "stubs.h"
 
 #define RSD_MAX_SEGS   16
+#define RSD_MAX_SECTS  64
 #define RSD_MAX_DYLIBS 128
 
 typedef struct {
@@ -34,6 +35,11 @@ typedef struct {
     uint64_t fileoff, filesize;
     uint32_t initprot, maxprot;
 } rsd_seg;
+
+typedef struct {
+    char     seg[17], name[17];
+    uint64_t addr, size;
+} rsd_sect;
 
 typedef struct {
     const char *name;   // imported symbol
@@ -52,6 +58,9 @@ typedef struct {
 
     rsd_seg     segs[RSD_MAX_SEGS];
     int         nsegs;
+
+    rsd_sect    sects[RSD_MAX_SECTS];
+    int         nsects;
 
     const char *dylibs[RSD_MAX_DYLIBS];
     int         ndylibs;
@@ -83,5 +92,11 @@ void rsd_stubs_of(const rsd_image *img, rsd_stubs *out);
 
 // Look each import up in the native arm64 frameworks already loaded here.
 void rsd_resolve_imports(rsd_image *img);
+
+// Hand the image's Objective-C metadata to the native runtime. Selector
+// references in the image point at its own strings; the runtime identifies
+// selectors by pointer, so they have to be replaced with canonical ones.
+int  rsd_objc_prepare(rsd_image *img, rsd_as *as);
+const rsd_sect *rsd_find_sect(const rsd_image *img, const char *name);
 
 #endif

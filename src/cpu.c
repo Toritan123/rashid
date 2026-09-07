@@ -426,20 +426,27 @@ static void do_syscall(rsd_cpu *c) {
 // arguments passed on the stack, structs passed or returned by value, or
 // variadic functions, which on macOS arm64 take every variadic argument on
 // the stack rather than in registers.
+// A scalar comes back in x0 or d0; a 16-byte struct in x0:x1 or d0:d1. Which
+// pair the signature meant is not known here, so all four are written. rax,
+// rdx, xmm0 and xmm1 are all caller-saved in System V, so a correct guest
+// cannot observe the ones it did not ask for. Then return to the caller.
+static void finish_native_call(rsd_cpu *c, const uint64_t ret[4]) {
+    c->r[RAX] = ret[0];
+    c->r[RDX] = ret[1];
+    c->xmm[0].q[0] = ret[2];
+    c->xmm[1].q[0] = ret[3];
+    c->rip = pop(c);
+}
+
 static void call_native(rsd_cpu *c, void *fn) {
     uint64_t x[8] = { c->r[RDI], c->r[RSI], c->r[RDX],
                       c->r[RCX], c->r[R8],  c->r[R9], 0, 0 };
     double d[8];
     for (int i = 0; i < 8; i++) d[i] = c->xmm[i].lf[0];
 
-    double rd = 0;
-    uint64_t rx = rsd_call_native(fn, x, d, NULL, 0, &rd);
-
-    // rax and xmm0 are both caller-saved, so setting the one the callee did
-    // not use cannot be observed by correct guest code.
-    c->r[RAX] = rx;
-    c->xmm[0].lf[0] = rd;
-    c->rip = pop(c);
+    uint64_t ret[4] = { 0 };
+    rsd_call_native(fn, x, d, NULL, 0, ret);
+    finish_native_call(c, ret);
 }
 
 // Reading arguments back out of the layout System V put them in: integers
@@ -486,7 +493,8 @@ static int marshal_format(rsd_cpu *c, uint64_t fmt, bool scan,
             if (!c->running || !ch) break;
             if (ch == '*') { star = true; continue; }
             if (ch == 'L') { long_double = true; continue; }
-            if (strchr("diouxXcspnfFeEgGaA%", (int)ch)) { conv = ch; break; }
+            // @ is an NSString conversion and takes an object pointer.
+            if (strchr("diouxXcspnfFeEgGaA@%", (int)ch)) { conv = ch; break; }
             // flags, field width, precision and length modifiers: skipped,
             // since none of them changes how many arguments are consumed.
         }
@@ -515,11 +523,34 @@ static void call_native_variadic(rsd_cpu *c, void *fn, const rsd_vaspec *sp) {
 
     uint64_t x[8] = { 0 };
     double   d[8] = { 0 };
-    for (int i = 0; i < sp->nfixed && i < 8; i++)
+    int nfixed = sp->nfixed, fmt_index = sp->fmt;
+
+    if (sp->objc) {
+        // objc_msgSend itself is not variadic - the compiler emits each call
+        // with its real signature. Only a handful of methods take an
+        // ellipsis, and which one this is depends on the selector in rsi.
+        nfixed = rsd_objc_variadic_sel(c->r[RSI]);
+        if (!nfixed) { call_native(c, fn); return; }
+        fmt_index = nfixed - 1;
+    }
+
+    for (int i = 0; i < nfixed && i < 8; i++)
         x[i] = sysv_int(&a);
 
+    uint64_t fmt = x[fmt_index];
+    if (sp->nsformat) {
+        const char *cs = rsd_objc_cstring(fmt);
+        if (!cs) {
+            c->fault = "cannot read the format string of a variadic call";
+            c->fault_rip = c->cur_rip;
+            c->running = false;
+            return;
+        }
+        fmt = (uint64_t)(uintptr_t)cs;
+    }
+
     uint64_t slots[64];
-    int n = marshal_format(c, x[sp->fmt], sp->scan, &a, slots, 64);
+    int n = marshal_format(c, fmt, sp->scan, &a, slots, 64);
     if (n < 0) {
         if (!c->fault) {
             c->fault = "cannot forward this variadic call";
@@ -529,11 +560,9 @@ static void call_native_variadic(rsd_cpu *c, void *fn, const rsd_vaspec *sp) {
         return;
     }
 
-    double rd = 0;
-    uint64_t rx = rsd_call_native(fn, x, d, slots, (uint64_t)n * 8, &rd);
-    c->r[RAX] = rx;
-    c->xmm[0].lf[0] = rd;
-    c->rip = pop(c);
+    uint64_t ret[4] = { 0 };
+    rsd_call_native(fn, x, d, slots, (uint64_t)n * 8, ret);
+    finish_native_call(c, ret);
 }
 
 // ------------------------------------------------------------------- SSE

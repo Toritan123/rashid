@@ -1,6 +1,8 @@
 CC      ?= clang
 CFLAGS  ?= -O2 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -arch arm64
-SRC      = src/as.c src/macho.c src/fixups.c src/thunk.c src/cpu.c src/main.c src/callgate.S
+# -lobjc: rashid registers the guest image's selectors with the native runtime.
+LDFLAGS ?= -lobjc
+SRC      = src/as.c src/macho.c src/fixups.c src/thunk.c src/objc.c src/cpu.c src/main.c src/callgate.S
 BIN      = rashid
 
 .PHONY: all clean test
@@ -8,7 +10,7 @@ BIN      = rashid
 all: $(BIN)
 
 $(BIN): $(SRC) src/as.h src/macho.h src/cpu.h src/stubs.h
-	$(CC) $(CFLAGS) -o $@ $(SRC)
+	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
 
 # Freestanding x86_64 guests. Linked against libSystem so the result is PIE -
 # ld64 forces non-PIE with -static, and a non-PIE image wants 0x100000000,
@@ -18,7 +20,7 @@ tests/%.x86: tests/%.c
 	clang -arch x86_64 -nostdlib -lSystem -Wl,-e,_start -O1 -o $@ $<
 
 GUESTS = hello arith tls ripimm sse vm fault
-EXTRA  = tests/import.x86 tests/native.x86 tests/varargs.x86
+EXTRA  = tests/import.x86 tests/native.x86 tests/varargs.x86 tests/objc.x86
 
 test: $(BIN) $(GUESTS:%=tests/%.x86) $(EXTRA)
 	@./tests/run.sh
@@ -36,3 +38,6 @@ tests/native.x86: tests/native.c
 
 tests/varargs.x86: tests/varargs.c
 	clang -arch x86_64 -O1 -o $@ $<
+
+tests/objc.x86: tests/objc.m
+	clang -arch x86_64 -O1 -fobjc-arc -framework Foundation -o $@ $<

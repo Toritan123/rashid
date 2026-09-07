@@ -33,6 +33,7 @@
 #include "macho.h"
 
 #include <dlfcn.h>
+#include <stdio.h>
 #include <mach-o/loader.h>
 #include <string.h>
 
@@ -72,16 +73,18 @@ static bool addr_is_code(const void *p) {
 // is what applications actually reach for. Anything else variadic will be
 // handed its arguments in registers and misbehave; that is a known gap.
 static const struct { const char *name; rsd_vaspec spec; } variadics[] = {
-    { "printf",    { 1, 0, false } },
-    { "fprintf",   { 2, 1, false } },
-    { "sprintf",   { 2, 1, false } },
-    { "snprintf",  { 3, 2, false } },
-    { "dprintf",   { 2, 1, false } },
-    { "asprintf",  { 2, 1, false } },
-    { "syslog",    { 2, 1, false } },
-    { "scanf",     { 1, 0, true  } },
-    { "fscanf",    { 2, 1, true  } },
-    { "sscanf",    { 2, 1, true  } },
+    { "printf",    { 1, 0, false, false, false } },
+    { "fprintf",   { 2, 1, false, false, false } },
+    { "sprintf",   { 2, 1, false, false, false } },
+    { "snprintf",  { 3, 2, false, false, false } },
+    { "dprintf",   { 2, 1, false, false, false } },
+    { "asprintf",  { 2, 1, false, false, false } },
+    { "syslog",    { 2, 1, false, false, false } },
+    { "scanf",     { 1, 0, true, false, false } },
+    { "fscanf",    { 2, 1, true, false, false } },
+    { "sscanf",    { 2, 1, true, false, false } },
+    { "NSLog",     { 1, 0, false, true,  false } },
+    { "objc_msgSend", { 2, -1, false, true, true } },
 };
 
 const rsd_vaspec *rsd_variadic_spec(const char *symbol) {
@@ -92,7 +95,20 @@ const rsd_vaspec *rsd_variadic_spec(const char *symbol) {
     return NULL;
 }
 
+// Bring in the libraries the image asks for. They exist on this machine as
+// arm64, at the very paths the x86_64 image names, so a dlopen is all it
+// takes - the frameworks do not have to be reimplemented or translated,
+// which is the premise the whole design rests on.
+static void load_dependencies(const rsd_image *img) {
+    for (int i = 0; i < img->ndylibs; i++) {
+        if (!dlopen(img->dylibs[i], RTLD_LAZY | RTLD_GLOBAL))
+            fprintf(stderr, "rashid: cannot load %s: %s\n",
+                    img->dylibs[i], dlerror());
+    }
+}
+
 void rsd_resolve_imports(rsd_image *img) {
+    load_dependencies(img);
     for (int i = 0; i < img->nimports; i++) {
         rsd_import *im = &img->imports[i];
         const char *n = im->name;

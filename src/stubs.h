@@ -36,7 +36,18 @@ typedef struct {
     int  nfixed;   // arguments before the ellipsis
     int  fmt;      // which of them is the format string
     bool scan;     // scanf family: every conversion consumes a pointer
+    bool nsformat; // the format is an NSString, not a C string
+    bool objc;     // objc_msgSend: whether it is variadic depends on the
+                   // selector, so that is decided at call time
 } rsd_vaspec;
+
+// Borrow a C string from an NSString the guest handed us. The object is a
+// native one, so this is an ordinary message send.
+const char *rsd_objc_cstring(uint64_t nsstring);
+
+// If this selector names a variadic method, the number of fixed arguments
+// including self and _cmd, with the format string last. Zero otherwise.
+int rsd_objc_variadic_sel(uint64_t sel);
 
 const rsd_vaspec *rsd_variadic_spec(const char *symbol);
 
@@ -51,8 +62,8 @@ typedef struct {
 
 // The call gate, implemented in callgate.S: enter a native arm64 function
 // with a chosen register and stack state, capturing both return registers.
-uint64_t rsd_call_native(void *fn, const uint64_t x[8], const double d[8],
-                         const void *stack, uint64_t stackbytes, double *ret_d);
+void rsd_call_native(void *fn, const uint64_t x[8], const double d[8],
+                     const void *stack, uint64_t stackbytes, uint64_t ret[4]);
 
 // Which import does this address belong to, or -1.
 static inline int rsd_stub_index(const rsd_stubs *s, uint64_t addr) {

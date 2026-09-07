@@ -60,20 +60,45 @@ PrivateFramework については、その x86_64 版を丸ごと翻訳して動�
   全 import を解決する
 - **C 関数の thunk**。翻訳されたコードがネイティブ arm64 の libSystem を
   呼び、正しい結果を受け取る。可変長引数を含む
+- **Objective-C**。セレクタをネイティブランタイムに登録し、クラスと定数文字列を
+  実オブジェクトに bind し、メッセージ送信をマシン上の arm64 Foundation で走らせる
 - クラス判定付きの syscall: `read` / `write` / `close` / `exit` /
   `thread_fast_set_cthread_self`
 
-動かないもの: Objective-C のメッセージ送信。したがって Cocoa アプリは
-まだ動かない。他に AVX、x87、シグナル、スレッド、ファイル実体を伴う `mmap`。
+動かないもの: AppKit と GUI 全般、アプリ自身が定義するクラス、
+AVX、x87、シグナル、スレッド、ファイル実体を伴う `mmap`。
 
-通常リンクされた x86_64 バイナリが最後まで動き、実機と1バイト違わぬ出力を出す。
+Objective-C バイナリが最後まで動き、実機と同一の出力を出す。
 
 ```
-$ ./native.x86                              $ rashid native.x86
-running through native arm64 libSystem      running through native arm64 libSystem
-all native calls returned correctly         all native calls returned correctly
-exit 14                                     exit 14
+len=23              range=6,9           double=2.50
+prefix=1            count=3 first=x     dict=v
+format=built/7      NSLog reached with hello objective-c world (23)
 ```
+
+### Objective-C は予想より簡単で、予想外に難しかった
+
+`objc_msgSend` には特別扱いが一切要らなかった。可変長引数に見えるが違う。
+コンパイラは各呼び出し地点の本当のシグネチャを知っていて通常の呼び出しを
+出すので、System V と AAPCS64 のレジスタ割り当てが一致し、汎用 thunk が
+そのまま通る。
+
+必要だったのは、本来 dyld がランタイムに伝える内容のほう。イメージ内の
+セレクタ参照はそのイメージ自身の文字列を指しており、`objc_msgSend` は
+セレクタを文字列ではなくポインタで比較するため、ロード時に全て
+ネイティブランタイムへ登録し直す。クラス参照と定数文字列は、データ
+シンボルの直接 bind で既に解決している。
+
+本当に作業が要ったのは3点。いずれも動かして誤りを目撃して見つけた:
+
+- 16バイト構造体は片方が `rax:rdx`、もう片方が `x0:x1` で返る。`x0` しか
+  拾っていなかったので `[s rangeOfString:]` が「もっともらしい位置と
+  ゴミの長さ」を返した
+- `NSLog` の書式は C 文字列ではなく **NSString**。読むにはオブジェクトに
+  バイト列を尋ねる必要がある — 相手はネイティブなので普通のメッセージ送信
+- `stringWithFormat:` など一部の ObjC メソッドは可変長引数を取る。メソッドの
+  型エンコーディングは宣言された引数しか記述しないので可変長性は metadata
+  から判別できず、セレクタを一覧で引くしかない
 
 ### ABI 境界を越える
 

@@ -72,6 +72,10 @@ compare native
 compare varargs
 
 echo
+echo "== Objective-C (message sends into native arm64 Foundation) =="
+compare objc
+
+echo
 echo "== dynamic loading (chained fixups walked, imports resolved) =="
 out=$("$BIN" -l tests/import.x86 2>&1)
 case $out in

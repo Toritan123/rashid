@@ -106,6 +106,16 @@ int rsd_load(rsd_image *img, rsd_as *as, const char *path) {
             s->initprot = (uint32_t)sc->initprot;
             s->maxprot  = (uint32_t)sc->maxprot;
             if (strcmp(sc->segname, SEG_TEXT) == 0) img->pref_base = sc->vmaddr;
+
+            const struct section_64 *sec = (const void *)(sc + 1);
+            for (uint32_t k = 0; k < sc->nsects; k++) {
+                if (img->nsects >= RSD_MAX_SECTS) break;
+                rsd_sect *d = &img->sects[img->nsects++];
+                memcpy(d->seg, sec[k].segname, 16);  d->seg[16] = 0;
+                memcpy(d->name, sec[k].sectname, 16); d->name[16] = 0;
+                d->addr = sec[k].addr;
+                d->size = sec[k].size;
+            }
             break;
         }
         case LC_MAIN: {
@@ -194,6 +204,12 @@ int rsd_load(rsd_image *img, rsd_as *as, const char *path) {
 fail:
     rsd_unload(img);
     return -1;
+}
+
+const rsd_sect *rsd_find_sect(const rsd_image *img, const char *name) {
+    for (int i = 0; i < img->nsects; i++)
+        if (!strcmp(img->sects[i].name, name)) return &img->sects[i];
+    return NULL;
 }
 
 void rsd_unload(rsd_image *img) {

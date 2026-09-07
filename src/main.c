@@ -53,6 +53,7 @@ int main(int argc, char **argv) {
     rsd_image img;
     if (rsd_load(&img, &as, argv[i]) < 0) return 1;
     if (rsd_fixups(&img, &as) < 0) return 1;
+    rsd_objc_prepare(&img, &as);
     rsd_dump(&img);
 
     rsd_stubs stubs;

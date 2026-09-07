@@ -24,12 +24,15 @@
 // variadic arguments on macOS arm64 all go on the stack, so the gate has to
 // be able to place an arbitrary block there.
 //
-//   uint64_t rsd_call_native(void *fn,
-//                            const uint64_t x[8],   // -> x0..x7
-//                            const double   d[8],   // -> d0..d7
-//                            const void    *stack,  // copied above sp
-//                            uint64_t       stackbytes,
-//                            double        *ret_d); // d0 on return
+// A 16-byte struct comes back in x0:x1 (or d0:d1), so all four are captured;
+// the caller decides which ones the signature meant.
+//
+//   void rsd_call_native(void *fn,
+//                        const uint64_t x[8],   // -> x0..x7
+//                        const double   d[8],   // -> d0..d7
+//                        const void    *stack,  // copied above sp
+//                        uint64_t       stackbytes,
+//                        uint64_t       ret[4]);// x0, x1, d0 bits, d1 bits
         .text
         .globl  _rsd_call_native
         .p2align 2
@@ -68,7 +71,8 @@ _rsd_call_native:
 
         blr     x19
 
-        str     d0, [x20]
+        stp     x0, x1, [x20, #0]
+        stp     d0, d1, [x20, #16]
         mov     sp, x29
         ldp     x19, x20, [sp, #16]
         ldp     x21, x22, [sp, #32]

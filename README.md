@@ -9,9 +9,10 @@ Intel-only Mac applications that still exist stop launching.
 Rashid is a clean-room userspace translator built to keep them working. It is
 not derived from Rosetta and does not require it.
 
-> **Status: early.** Rashid runs freestanding x86_64 Mach-O executables today.
-> It cannot yet run applications that link against system libraries — that is
-> milestone M4. See [Roadmap](#roadmap).
+> **Status: early, but it works.** Rashid runs real x86_64 Mach-O
+> executables, including Objective-C ones, sending messages into the native
+> arm64 Foundation on the machine. Coverage is far from complete — see
+> [Roadmap](#roadmap).
 
 [日本語版 README](README.ja.md)
 
@@ -91,23 +92,52 @@ make test
   loaded in the process.
 - **Thunks for C functions.** Translated code calls into native arm64
   libSystem and gets correct answers back, including variadic calls.
+- **Objective-C.** Selectors are registered with the native runtime, classes
+  and constant strings bind to the real objects, and message sends run in the
+  arm64 Foundation already on the machine.
 - A few macOS syscalls, dispatched by class: `read`, `write`, `close`,
   `exit`, `thread_fast_set_cthread_self`
 
-Not yet: Objective-C message sends, so no Cocoa application runs. Also AVX,
-x87, signals, threads, file-backed guest `mmap`.
+Not yet: AppKit and anything with a user interface, classes defined by the
+application itself, AVX, x87, signals, threads, file-backed guest `mmap`.
 
-A normally linked x86_64 binary runs to completion, producing byte-identical
-output to the same binary run natively:
+An Objective-C binary runs to completion with output identical to the same
+binary run natively:
 
 ```
-$ ./native.x86                                $ rashid native.x86
-running through native arm64 libSystem        running through native arm64 libSystem
-all native calls returned correctly           all native calls returned correctly
-exit 14                                       exit 14
+len=23              range=6,9           double=2.50
+prefix=1            count=3 first=x     dict=v
+format=built/7      NSLog reached with hello objective-c world (23)
 ```
 
-### Crossing the ABI boundary
+### Objective-C needed less than expected, and more
+
+`objc_msgSend` needs no special handling at all. It looks variadic, but it
+is not: the compiler knows each call site's real signature and emits an
+ordinary call, so System V's and AAPCS64's register assignments line up and
+the generic thunk carries it unchanged.
+
+What does need doing is what dyld would have told the runtime. Selector
+references in an image start out pointing at strings inside that image, and
+`objc_msgSend` compares selectors by pointer rather than by text, so every
+one is re-registered with the native runtime at load time. Class references
+and constant strings are already handled by binding data symbols directly.
+
+Three things did need real work, and each was found by running something and
+watching it be wrong:
+
+- A 16-byte struct comes back in `rax:rdx` on one side and `x0:x1` on the
+  other. Capturing only `x0` made `[s rangeOfString:]` return a plausible
+  location and a garbage length.
+- `NSLog` is variadic with an *NSString* format, not a C string. Reading it
+  means asking the object for its bytes — an ordinary message send, since the
+  object is native.
+- A few Objective-C methods take an ellipsis, `stringWithFormat:` among them.
+  A method's type encoding describes only its declared arguments, so
+  variadicity cannot be discovered from metadata; the selector is looked up
+  in a list instead.
+
+### Crossing the ABI boundary### Crossing the ABI boundary
 
 The two integer conventions line up almost exactly — System V's `rdi, rsi,
 rdx, rcx, r8, r9` become AAPCS64's `x0..x5`, and floating-point arguments sit
@@ -232,6 +262,9 @@ against a live native run of the very same binary.
 == native thunks (real binaries running through arm64 libSystem) ==
   native   output and exit status match native (14)
   varargs  output and exit status match native (0)
+
+== Objective-C (message sends into native arm64 Foundation) ==
+  objc     output and exit status match native (0)
 ```
 
 The live comparison is the valuable one: it checks against the actual CPU
@@ -254,11 +287,14 @@ plausible nearby address instead of faulting.
 | M1b | TLS (`%gs`), guest `mmap` — done; signals remain | partial |
 | M2 | SSE — done; x87 remains | partial |
 | M3 | chained fixups, binding, C thunks — done | done |
-| **M4** | **generated `objc_msgSend` thunks — first Cocoa application launches** | next |
+| **M4** | **Objective-C: selectors registered, message sends into native Foundation** | **done** |
 | M5 | basic-block JIT (`MAP_JIT` + `pthread_jit_write_protect_np`) | |
 | M6 | AOT cache, trace JIT | |
 
-**M4 is the goal line.** M5 and M6 make it fast; they do not change what runs.
+**M4 was the goal line, and a Foundation application now runs.** What remains
+is coverage — AppKit, application-defined classes, the long tail of the
+instruction set — and then speed. M5 and M6 make it fast; they do not change
+what runs.
 
 ## Clean-room
 

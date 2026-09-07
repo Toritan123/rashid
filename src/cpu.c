@@ -438,11 +438,13 @@ static void finish_native_call(rsd_cpu *c, const uint64_t ret[4]) {
     c->rip = pop(c);
 }
 
-static void call_native(rsd_cpu *c, void *fn, int cbarg) {
+static void call_native(rsd_cpu *c, void *fn, int cbarg, bool objcrecv) {
     uint64_t x[8] = { c->r[RDI], c->r[RSI], c->r[RDX],
                       c->r[RCX], c->r[R8],  c->r[R9], 0, 0 };
     if (cbarg >= 0 && cbarg < 6)
         x[cbarg] = rsd_callback_for(x[cbarg]);
+    if (objcrecv)
+        x[0] = rsd_objc_real_class(x[0]);
     double d[8];
     for (int i = 0; i < 8; i++) d[i] = c->xmm[i].lf[0];
 
@@ -520,7 +522,8 @@ static int marshal_format(rsd_cpu *c, uint64_t fmt, bool scan,
 // macOS arm64 passes every variadic argument on the stack, one 8-byte slot
 // each, while System V passes the first few in registers. Bridging the two
 // means knowing how many arguments there are, which the format string says.
-static void call_native_variadic(rsd_cpu *c, void *fn, const rsd_vaspec *sp) {
+static void call_native_variadic(rsd_cpu *c, void *fn, const rsd_vaspec *sp,
+                                 bool objcrecv) {
     sysv_reader a = { c, 0, 0, c->r[RSP] + 8 };   // past the return address
 
     uint64_t x[8] = { 0 };
@@ -532,12 +535,13 @@ static void call_native_variadic(rsd_cpu *c, void *fn, const rsd_vaspec *sp) {
         // with its real signature. Only a handful of methods take an
         // ellipsis, and which one this is depends on the selector in rsi.
         nfixed = rsd_objc_variadic_sel(c->r[RSI]);
-        if (!nfixed) { call_native(c, fn, -1); return; }
+        if (!nfixed) { call_native(c, fn, -1, objcrecv); return; }
         fmt_index = nfixed - 1;
     }
 
     for (int i = 0; i < nfixed && i < 8; i++)
         x[i] = sysv_int(&a);
+    if (objcrecv) x[0] = rsd_objc_real_class(x[0]);
 
     uint64_t fmt = x[fmt_index];
     if (sp->nsformat) {
@@ -1014,8 +1018,9 @@ static void step(rsd_cpu *c) {
     if (imp >= 0 && c->stubs->fns && c->stubs->fns[imp]) {
         const rsd_vaspec *sp = c->stubs->va ? c->stubs->va[imp] : NULL;
         int cb = c->stubs->cbarg ? c->stubs->cbarg[imp] : -1;
-        if (sp) call_native_variadic(c, c->stubs->fns[imp], sp);
-        else    call_native(c, c->stubs->fns[imp], cb);
+        bool rc = c->stubs->objcrecv && c->stubs->objcrecv[imp];
+        if (sp) call_native_variadic(c, c->stubs->fns[imp], sp, rc);
+        else    call_native(c, c->stubs->fns[imp], cb, rc);
         return;
     }
     if (imp >= 0) {

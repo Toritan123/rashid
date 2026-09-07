@@ -49,12 +49,18 @@ const char *rsd_objc_cstring(uint64_t nsstring);
 // including self and _cmd, with the format string last. Zero otherwise.
 int rsd_objc_variadic_sel(uint64_t sel);
 
+// An image's own class structures are handles, not real classes. Wherever the
+// guest hands one across the boundary it has to become the class the runtime
+// actually registered.
+uint64_t rsd_objc_real_class(uint64_t maybe_guest_class);
+
 const rsd_vaspec *rsd_variadic_spec(const char *symbol);
 
 // Which argument of this function, if any, is a callback the guest supplies.
 // Native code cannot call guest code directly, so such an argument has to be
 // replaced with a trampoline before the call goes out.
-int rsd_callback_arg(const char *symbol);
+int  rsd_callback_arg(const char *symbol);
+bool rsd_takes_objc_receiver(const char *symbol);
 
 typedef struct {
     uint64_t     base;      // guest address of stub 0
@@ -64,6 +70,7 @@ typedef struct {
     void       **fns;       // native arm64 implementation, or NULL
     const signed char *cbarg; // argument index that is a guest function
                               // pointer, or -1
+    const unsigned char *objcrecv; // takes an Objective-C receiver in arg 0
     const rsd_vaspec **va;  // non-NULL where the function is variadic
 } rsd_stubs;
 

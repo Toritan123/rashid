@@ -75,6 +75,7 @@ compare callback
 echo
 echo "== Objective-C (message sends into native arm64 Foundation) =="
 compare objc
+compare objcclass
 
 echo
 echo "== dynamic loading (chained fixups walked, imports resolved) =="

@@ -166,13 +166,16 @@ void rsd_stubs_of(const rsd_image *img, rsd_stubs *out) {
     out->fns = calloc((size_t)img->nimports, sizeof(void *));
     out->va  = calloc((size_t)img->nimports, sizeof(rsd_vaspec *));
     signed char *cb = calloc((size_t)img->nimports, 1);
+    unsigned char *rc = calloc((size_t)img->nimports, 1);
     out->cbarg = cb;
-    if (!out->fns || !out->va || !cb) { out->n = 0; return; }
+    out->objcrecv = rc;
+    if (!out->fns || !out->va || !cb || !rc) { out->n = 0; return; }
     for (int i = 0; i < img->nimports; i++) {
         out->names[i] = img->imports[i].name;
         out->libs[i]  = img->imports[i].lib;
         out->fns[i]   = img->imports[i].is_code ? img->imports[i].native : NULL;
         out->va[i]    = rsd_variadic_spec(img->imports[i].name);
         cb[i]         = (signed char)rsd_callback_arg(img->imports[i].name);
+        rc[i]         = rsd_takes_objc_receiver(img->imports[i].name);
     }
 }

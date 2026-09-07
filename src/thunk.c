@@ -55,13 +55,21 @@ static bool addr_is_code(const void *p) {
     }
     uint64_t slide = (uint64_t)(uintptr_t)mh - text_vm;
 
+    // Segment protection is not enough on its own: __TEXT is executable but
+    // holds read-only data sections too, and __objc_empty_cache lives in
+    // (__TEXT,__const). Ask the containing section whether it holds
+    // instructions.
     lc = (const void *)(mh + 1);
     for (uint32_t i = 0; i < mh->ncmds; i++) {
         if (lc->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *sc = (const void *)lc;
-            uint64_t s = sc->vmaddr + slide;
-            if (target >= s && target < s + sc->vmsize)
-                return (sc->initprot & VM_PROT_EXECUTE) != 0;
+            const struct section_64 *sec = (const void *)(sc + 1);
+            for (uint32_t k = 0; k < sc->nsects; k++) {
+                uint64_t s = sec[k].addr + slide;
+                if (target >= s && target < s + sec[k].size)
+                    return (sec[k].flags &
+                            (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)) != 0;
+            }
         }
         lc = (const void *)((const uint8_t *)lc + lc->cmdsize);
     }
@@ -97,6 +105,15 @@ static const struct { const char *name; int arg; } callback_args[] = {
     { "heapsort",3 },
     { "mergesort",3 },
 };
+
+// Entry points whose first argument is an Objective-C receiver, which may be
+// one of the image's own class structures rather than a real class.
+bool rsd_takes_objc_receiver(const char *symbol) {
+    if (!symbol) return false;
+    const char *n = symbol[0] == '_' ? symbol + 1 : symbol;
+    return !strncmp(n, "objc_", 5) || !strncmp(n, "object_", 7) ||
+           !strncmp(n, "class_", 6);
+}
 
 int rsd_callback_arg(const char *symbol) {
     if (!symbol) return -1;

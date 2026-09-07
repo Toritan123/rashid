@@ -20,7 +20,7 @@ tests/%.x86: tests/%.c
 	clang -arch x86_64 -nostdlib -lSystem -Wl,-e,_start -O1 -o $@ $<
 
 GUESTS = hello arith tls ripimm sse vm fault
-EXTRA  = tests/import.x86 tests/native.x86 tests/varargs.x86 tests/objc.x86 tests/callback.x86
+EXTRA  = tests/import.x86 tests/native.x86 tests/varargs.x86 tests/objc.x86 tests/callback.x86 tests/objcclass.x86
 
 test: $(BIN) $(GUESTS:%=tests/%.x86) $(EXTRA)
 	@./tests/run.sh
@@ -44,3 +44,6 @@ tests/objc.x86: tests/objc.m
 
 tests/callback.x86: tests/callback.c
 	clang -arch x86_64 -O1 -o $@ $<
+
+tests/objcclass.x86: tests/objcclass.m
+	clang -arch x86_64 -O1 -fobjc-arc -framework Foundation -o $@ $<

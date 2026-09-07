@@ -96,13 +96,14 @@ make test
   and constant strings bind to the real objects, and message sends run in the
   arm64 Foundation already on the machine.
 - **Callbacks into guest code.** Native frameworks can call back into
-  translated code — a comparator handed to `qsort`, and in time a method
-  implementation or a delegate.
+  translated code — a comparator handed to `qsort`, a method implementation.
+- **Classes the application defines itself**, with instance variables, class
+  methods and calls to `super`.
 - A few macOS syscalls, dispatched by class: `read`, `write`, `close`,
   `exit`, `thread_fast_set_cthread_self`
 
-Not yet: AppKit and anything with a user interface, classes defined by the
-application itself, AVX, x87, signals, threads, file-backed guest `mmap`.
+Not yet: AppKit and anything with a user interface, categories, protocols,
+blocks, AVX, x87, signals, threads, file-backed guest `mmap`.
 
 An Objective-C binary runs to completion with output identical to the same
 binary run natively:
@@ -140,6 +141,34 @@ watching it be wrong:
   variadicity cannot be discovered from metadata; the selector is looked up
   in a list instead.
 
+### Classes an application defines
+
+The class is built through the public runtime API — allocate, add methods,
+register — with every implementation replaced by a trampoline, since the
+implementations are x86_64 code the runtime must not enter directly.
+Instance variables are declared the same way, and the offsets the runtime
+chooses are written back into the image, which is where compiled ivar
+accesses read them from.
+
+Then there is the question of identity. An image references its own classes
+by address: clang emits a direct `leaq` to `_OBJC_CLASS_$_Foo`, with no
+indirection to redirect. The obvious fix — copy the finished class object
+over the image's own — **does not work, because libobjc is arm64e and signs
+pointers with address diversity**. A class object moved to another address
+is no longer valid, and the runtime says so.
+
+So the image's structure is treated as a handle instead. Rashid remembers
+which real class it stands for and substitutes the real one wherever the
+guest passes it across the boundary, which is the only place its identity can
+be observed.
+
+```
+hits=5          describe=clicks=5     version=1.0
+isa=Counter     responds=1            byname=Counter
+```
+
+`RASHID_OBJC_DEBUG=1` prints what was found and registered.
+
 ### Calling back the other way
 
 A thunk lets translated code call a framework. Applications need the reverse
@@ -158,7 +187,35 @@ Which argument of a native function is a callback cannot be discovered
 without signatures, so the common ones — `qsort`, `bsearch`, `atexit` — are
 listed, the same gap as with variadic functions.
 
-### Crossing the ABI boundary### Calling back the other way
+### Crossing the ABI boundary### Classes an application defines
+
+The class is built through the public runtime API — allocate, add methods,
+register — with every implementation replaced by a trampoline, since the
+implementations are x86_64 code the runtime must not enter directly.
+Instance variables are declared the same way, and the offsets the runtime
+chooses are written back into the image, which is where compiled ivar
+accesses read them from.
+
+Then there is the question of identity. An image references its own classes
+by address: clang emits a direct `leaq` to `_OBJC_CLASS_$_Foo`, with no
+indirection to redirect. The obvious fix — copy the finished class object
+over the image's own — **does not work, because libobjc is arm64e and signs
+pointers with address diversity**. A class object moved to another address
+is no longer valid, and the runtime says so.
+
+So the image's structure is treated as a handle instead. Rashid remembers
+which real class it stands for and substitutes the real one wherever the
+guest passes it across the boundary, which is the only place its identity can
+be observed.
+
+```
+hits=5          describe=clicks=5     version=1.0
+isa=Counter     responds=1            byname=Counter
+```
+
+`RASHID_OBJC_DEBUG=1` prints what was found and registered.
+
+### Calling back the other way
 
 A thunk lets translated code call a framework. Applications need the reverse
 as well: `qsort` calls a comparator, a framework calls a delegate, an
@@ -191,7 +248,10 @@ the guest trying to execute arm64 instructions as x86. A data symbol — an
 Objective-C class object, a CoreFoundation constant — is never called, only
 dereferenced, so it binds straight to the native address. Rather than guess
 from the name, rashid looks the symbol up in its own image and asks whether
-the containing segment is executable.
+the containing *section* holds instructions. The segment is not enough:
+`__TEXT` is executable but carries read-only data too, and
+`__objc_empty_cache` — which every class points at — lives in
+`(__TEXT,__const)`.
 
 Variadic calls need real work. **macOS arm64 passes every variadic argument
 on the stack**, while System V passes the first few in registers, so
@@ -304,7 +364,8 @@ against a live native run of the very same binary.
   callback output and exit status match native (0)
 
 == Objective-C (message sends into native arm64 Foundation) ==
-  objc     output and exit status match native (0)
+  objc      output and exit status match native (0)
+  objcclass output and exit status match native (0)
 ```
 
 The live comparison is the valuable one: it checks against the actual CPU

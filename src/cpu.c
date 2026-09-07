@@ -438,9 +438,11 @@ static void finish_native_call(rsd_cpu *c, const uint64_t ret[4]) {
     c->rip = pop(c);
 }
 
-static void call_native(rsd_cpu *c, void *fn) {
+static void call_native(rsd_cpu *c, void *fn, int cbarg) {
     uint64_t x[8] = { c->r[RDI], c->r[RSI], c->r[RDX],
                       c->r[RCX], c->r[R8],  c->r[R9], 0, 0 };
+    if (cbarg >= 0 && cbarg < 6)
+        x[cbarg] = rsd_callback_for(x[cbarg]);
     double d[8];
     for (int i = 0; i < 8; i++) d[i] = c->xmm[i].lf[0];
 
@@ -530,7 +532,7 @@ static void call_native_variadic(rsd_cpu *c, void *fn, const rsd_vaspec *sp) {
         // with its real signature. Only a handful of methods take an
         // ellipsis, and which one this is depends on the selector in rsi.
         nfixed = rsd_objc_variadic_sel(c->r[RSI]);
-        if (!nfixed) { call_native(c, fn); return; }
+        if (!nfixed) { call_native(c, fn, -1); return; }
         fmt_index = nfixed - 1;
     }
 
@@ -944,9 +946,64 @@ static bool sse_exec(rsd_cpu *c, dec *d, uint8_t op2, uint64_t start) {
 }
 
 // ------------------------------------------------------------------ core
+// The interpreter is single-threaded, and a callback always happens inside a
+// native call that the interpreter itself made, so the running machine can be
+// found from here.
+static rsd_cpu *g_cpu;
+
+static void step(rsd_cpu *c);
+
+// Entered from trampoline.S when native code calls a guest function.
+void rsd_guest_call(uint64_t index, rsd_callframe *f) {
+    rsd_cpu *c = g_cpu;
+    uint64_t target = rsd_callback_target(index);
+    if (!c || !target) { f->x[0] = 0; return; }
+
+    uint64_t saved_r[16], saved_rip = c->rip;
+    uint32_t saved_flags = c->flags;
+    rsd_xmm  saved_x[16];
+    memcpy(saved_r, c->r, sizeof saved_r);
+    memcpy(saved_x, c->xmm, sizeof saved_x);
+
+    static const int order[6] = { RDI, RSI, RDX, RCX, R8, R9 };
+    for (int i = 0; i < 6; i++) c->r[order[i]] = f->x[i];
+    for (int i = 0; i < 8; i++) c->xmm[i].q[0] = f->d[i];
+
+    // The guest's own stack is untouched during a native call, so the frame
+    // goes below it, clear of the red zone.
+    uint64_t sp = ((saved_r[RSP] - 256) & ~15ull) - 8;
+    st(c, sp, RSD_CALLBACK_MAGIC, 8);
+    c->r[RSP] = sp;
+    c->rip = target;
+    c->running = true;
+
+    while (c->running) {
+        step(c);
+        c->icount++;
+    }
+
+    f->x[0] = c->r[RAX];
+    f->x[1] = c->r[RDX];
+    f->d[0] = c->xmm[0].q[0];
+    f->d[1] = c->xmm[1].q[0];
+
+    // A fault inside a callback cannot unwind out of the native frame in
+    // between, so it is carried back and stops the outer run instead.
+    bool faulted = c->fault != NULL;
+    memcpy(c->r, saved_r, sizeof saved_r);
+    memcpy(c->xmm, saved_x, sizeof saved_x);
+    c->rip = saved_rip;
+    c->flags = saved_flags;
+    c->running = !faulted;
+}
+
 static void step(rsd_cpu *c) {
     // These two land on addresses that are deliberately not ordinary guest
     // code, so they are recognised before the executable-memory check.
+    if (c->rip == RSD_CALLBACK_MAGIC) {        // a guest callback finished
+        c->running = false;
+        return;
+    }
     if (c->rip == RSD_RETURN_MAGIC) {          // main() returned
         c->running = false;
         c->exit_code = (int)(c->r[RAX] & 0xff);
@@ -956,8 +1013,9 @@ static void step(rsd_cpu *c) {
     int imp = rsd_stub_index(c->stubs, c->rip);
     if (imp >= 0 && c->stubs->fns && c->stubs->fns[imp]) {
         const rsd_vaspec *sp = c->stubs->va ? c->stubs->va[imp] : NULL;
+        int cb = c->stubs->cbarg ? c->stubs->cbarg[imp] : -1;
         if (sp) call_native_variadic(c, c->stubs->fns[imp], sp);
-        else    call_native(c, c->stubs->fns[imp]);
+        else    call_native(c, c->stubs->fns[imp], cb);
         return;
     }
     if (imp >= 0) {
@@ -1464,6 +1522,7 @@ void rsd_cpu_free(rsd_cpu *c) {
 }
 
 void rsd_cpu_run(rsd_cpu *c, uint64_t budget) {
+    g_cpu = c;
     while (c->running) {
         if (c->trace)
             fprintf(stderr, "  %6llu  rip=0x%llx rax=0x%llx rdi=0x%llx rsp=0x%llx\n",

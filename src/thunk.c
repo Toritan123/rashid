@@ -87,6 +87,25 @@ static const struct { const char *name; rsd_vaspec spec; } variadics[] = {
     { "objc_msgSend", { 2, -1, false, true, true } },
 };
 
+// Functions that take a function pointer from the caller. There is no way to
+// discover this without signatures, so the common ones are listed; the same
+// gap as with variadic functions, and the same eventual fix.
+static const struct { const char *name; int arg; } callback_args[] = {
+    { "qsort",   3 },
+    { "bsearch", 4 },
+    { "atexit",  0 },
+    { "heapsort",3 },
+    { "mergesort",3 },
+};
+
+int rsd_callback_arg(const char *symbol) {
+    if (!symbol) return -1;
+    const char *n = symbol[0] == '_' ? symbol + 1 : symbol;
+    for (size_t i = 0; i < sizeof callback_args / sizeof *callback_args; i++)
+        if (!strcmp(n, callback_args[i].name)) return callback_args[i].arg;
+    return -1;
+}
+
 const rsd_vaspec *rsd_variadic_spec(const char *symbol) {
     if (!symbol) return NULL;
     const char *n = symbol[0] == '_' ? symbol + 1 : symbol;

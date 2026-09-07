@@ -95,6 +95,9 @@ make test
 - **Objective-C.** Selectors are registered with the native runtime, classes
   and constant strings bind to the real objects, and message sends run in the
   arm64 Foundation already on the machine.
+- **Callbacks into guest code.** Native frameworks can call back into
+  translated code — a comparator handed to `qsort`, and in time a method
+  implementation or a delegate.
 - A few macOS syscalls, dispatched by class: `read`, `write`, `close`,
   `exit`, `thread_fast_set_cthread_self`
 
@@ -137,7 +140,43 @@ watching it be wrong:
   variadicity cannot be discovered from metadata; the selector is looked up
   in a list instead.
 
-### Crossing the ABI boundary### Crossing the ABI boundary
+### Calling back the other way
+
+A thunk lets translated code call a framework. Applications need the reverse
+as well: `qsort` calls a comparator, a framework calls a delegate, an
+Objective-C runtime calls a method implementation. All of those arrive as
+arm64 calls that have to end up in the x86_64 interpreter.
+
+Rashid hands out addresses from a block of assembled trampolines. Each one
+loads its own index and jumps to a shared dispatcher, which captures the
+argument registers and the caller's stack, saves the interpreter's state,
+runs the guest function, and puts the result back where AAPCS64 expects it.
+The stubs are assembled rather than generated at runtime, so this needs no
+`MAP_JIT` and no W^X handling.
+
+Which argument of a native function is a callback cannot be discovered
+without signatures, so the common ones — `qsort`, `bsearch`, `atexit` — are
+listed, the same gap as with variadic functions.
+
+### Crossing the ABI boundary### Calling back the other way
+
+A thunk lets translated code call a framework. Applications need the reverse
+as well: `qsort` calls a comparator, a framework calls a delegate, an
+Objective-C runtime calls a method implementation. All of those arrive as
+arm64 calls that have to end up in the x86_64 interpreter.
+
+Rashid hands out addresses from a block of assembled trampolines. Each one
+loads its own index and jumps to a shared dispatcher, which captures the
+argument registers and the caller's stack, saves the interpreter's state,
+runs the guest function, and puts the result back where AAPCS64 expects it.
+The stubs are assembled rather than generated at runtime, so this needs no
+`MAP_JIT` and no W^X handling.
+
+Which argument of a native function is a callback cannot be discovered
+without signatures, so the common ones — `qsort`, `bsearch`, `atexit` — are
+listed, the same gap as with variadic functions.
+
+### Crossing the ABI boundary
 
 The two integer conventions line up almost exactly — System V's `rdi, rsi,
 rdx, rcx, r8, r9` become AAPCS64's `x0..x5`, and floating-point arguments sit
@@ -262,6 +301,7 @@ against a live native run of the very same binary.
 == native thunks (real binaries running through arm64 libSystem) ==
   native   output and exit status match native (14)
   varargs  output and exit status match native (0)
+  callback output and exit status match native (0)
 
 == Objective-C (message sends into native arm64 Foundation) ==
   objc     output and exit status match native (0)

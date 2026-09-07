@@ -23,6 +23,7 @@
 
 #include "as.h"
 #include "stubs.h"
+#include "callback.h"
 
 enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI,
        R8,  R9,  R10, R11, R12, R13, R14, R15 };
@@ -74,6 +75,11 @@ typedef struct {
 // Where main() returns to. Not a valid guest address, so landing on it can
 // only mean the program finished.
 #define RSD_RETURN_MAGIC 0xfffffffffffff000ull
+
+// Where a guest function called back from native code returns to. Distinct
+// from RSD_RETURN_MAGIC so that finishing a callback is not mistaken for the
+// program finishing.
+#define RSD_CALLBACK_MAGIC 0xfffffffffffff100ull
 
 int  rsd_cpu_init(rsd_cpu *c, rsd_as *as, uint64_t entry, bool has_main,
                   int argc, char **argv);

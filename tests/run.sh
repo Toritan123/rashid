@@ -70,6 +70,7 @@ compare() {
 }
 compare native
 compare varargs
+compare callback
 
 echo
 echo "== Objective-C (message sends into native arm64 Foundation) =="

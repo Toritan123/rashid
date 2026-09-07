@@ -51,12 +51,19 @@ int rsd_objc_variadic_sel(uint64_t sel);
 
 const rsd_vaspec *rsd_variadic_spec(const char *symbol);
 
+// Which argument of this function, if any, is a callback the guest supplies.
+// Native code cannot call guest code directly, so such an argument has to be
+// replaced with a trampoline before the call goes out.
+int rsd_callback_arg(const char *symbol);
+
 typedef struct {
     uint64_t     base;      // guest address of stub 0
     int          n;
     const char **names;     // symbol name per stub
     const char **libs;      // library it was imported from
     void       **fns;       // native arm64 implementation, or NULL
+    const signed char *cbarg; // argument index that is a guest function
+                              // pointer, or -1
     const rsd_vaspec **va;  // non-NULL where the function is variadic
 } rsd_stubs;
 

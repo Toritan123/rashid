@@ -165,11 +165,14 @@ void rsd_stubs_of(const rsd_image *img, rsd_stubs *out) {
     if (!out->names || !out->libs) { out->n = 0; return; }
     out->fns = calloc((size_t)img->nimports, sizeof(void *));
     out->va  = calloc((size_t)img->nimports, sizeof(rsd_vaspec *));
-    if (!out->fns || !out->va) { out->n = 0; return; }
+    signed char *cb = calloc((size_t)img->nimports, 1);
+    out->cbarg = cb;
+    if (!out->fns || !out->va || !cb) { out->n = 0; return; }
     for (int i = 0; i < img->nimports; i++) {
         out->names[i] = img->imports[i].name;
         out->libs[i]  = img->imports[i].lib;
         out->fns[i]   = img->imports[i].is_code ? img->imports[i].native : NULL;
         out->va[i]    = rsd_variadic_spec(img->imports[i].name);
+        cb[i]         = (signed char)rsd_callback_arg(img->imports[i].name);
     }
 }

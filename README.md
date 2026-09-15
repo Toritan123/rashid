@@ -7,13 +7,13 @@ compatibility shim for a handful of old games, and the roughly 18,000
 Intel-only Mac applications that still exist stop launching.
 
 Rashid is a clean-room userspace translator built to keep them working. It is
-not derived from Rosetta and does not require it — as of macOS 27, that is no
-longer a claim but an observation.
+not derived from Rosetta and does not require it, which macOS 27 briefly
+turned from a claim into an observation.
 
-> **Status: early, but it works — and it has now been shown to work without
-> Rosetta.** Upgrading the development machine to macOS 27 removed Rosetta.
-> On that machine the operating system refuses to execute an x86_64 binary at
-> all, and rashid runs one anyway:
+> **Status: early, but it works — and it has been shown to work without
+> Rosetta.** Upgrading the development machine to macOS 27 removed Rosetta,
+> and for a while that machine refused to execute an x86_64 binary at all.
+> Rashid ran one anyway:
 >
 > ```
 > $ ./objcclass.x86
@@ -26,7 +26,11 @@ longer a claim but an observation.
 >
 > That is an application defining its own Objective-C class, its methods
 > running in the interpreter and its messages going into the native arm64
-> Foundation. Coverage is still far from complete — see [Roadmap](#roadmap).
+> Foundation.
+>
+> macOS then reinstalled Rosetta on demand, as it still does through macOS 27,
+> so the machine can execute x86_64 again — but the window was real and so was
+> the result. Coverage is still far from complete — see [Roadmap](#roadmap).
 
 [日本語版 README](README.ja.md)
 
@@ -363,10 +367,11 @@ Guests are x86_64 binaries that compute something and exit with the answer.
 hardware and, where the machine can still execute x86_64, against a live
 native run of the very same binary.
 
-The fallback is no longer hypothetical. The development machine upgraded to
-macOS 27 and lost Rosetta, so every comparison now runs against recordings
-made while it was still there. `tests/expected/` holds them, and the reason
-the recordings were made early is exactly this.
+The fallback is no longer hypothetical. When the development machine upgraded
+to macOS 27 and lost Rosetta, every comparison fell back to `tests/expected/`
+and the suite stayed green. Rosetta came back and the live comparison agreed
+with those recordings, which is as good a check of them as there will ever
+be.
 
 ```
 == behaviour (exit status must match real x86_64) ==

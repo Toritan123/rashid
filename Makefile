@@ -47,3 +47,10 @@ tests/callback.x86: tests/callback.c
 
 tests/objcclass.x86: tests/objcclass.m
 	clang -arch x86_64 -O1 -fobjc-arc -framework Foundation -o $@ $<
+
+tests/bench.x86: tests/bench.c
+	clang -arch x86_64 -O1 -o $@ $<
+
+.PHONY: bench
+bench: $(BIN) tests/bench.x86 $(EXTRA)
+	@./tests/bench.sh

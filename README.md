@@ -403,6 +403,60 @@ bytes early, because the displacement is measured from the end of the
 *entire* instruction, immediates included. Every affected access landed on a
 plausible nearby address instead of faulting.
 
+## Speed
+
+`make bench`. Measured on an M1 against the same binary run through Rosetta.
+
+```
+startup: native 11.8ms, rashid 6.4ms
+
+work       guest instr    native    rashid   ratio  compute  M instr/s
+int         14,000,052     13.3m    176.4m     13x     108x       82.3
+mem         20,000,060     13.1m    322.0m     25x     243x       63.4
+flt         26,000,070     21.2m    361.0m     17x      38x       73.3
+thunk        7,000,074     22.7m    109.3m      5x       9x       68.0
+```
+
+The interpreter runs at 60–80 million guest instructions per second, which
+puts it 40–240x behind Rosetta on code the guest actually executes. That is
+an ordinary number for a switch-dispatch interpreter, and closing it is what
+the JIT is for; the spread is informative too. Floating point costs only 38x
+because one guest instruction does more work, and thunk-heavy code only 9x
+because rashid barely interprets — the work happens in native arm64
+libSystem either way.
+
+Whole applications tell a different story, because most of what an
+application does is not its own code:
+
+```
+app            guest instr    native    rashid   ratio
+native                  70     13.4m      7.1m    0.5x
+objc                   187     17.7m     11.8m    0.7x
+objcclass              282     15.9m     10.7m    0.7x
+```
+
+Rashid starts in half the time, because it has nothing to translate: the
+frameworks are already arm64. So there is a crossover, and it sits at a few
+hundred thousand guest instructions:
+
+```
+  iterations   guest instr    native    rashid   ratio
+           0            49     13.7m      7.1m    0.5x
+      10,000        70,052     13.9m      7.9m    0.6x
+     100,000       700,052     13.4m     16.9m    1.3x
+   1,000,000     7,000,052     14.6m     92.7m    6.4x
+```
+
+Below that, rashid wins on startup alone. Above it, interpretation dominates
+and Rosetta pulls away. Short-lived tools are already competitive; anything
+that computes is not, and will not be until the JIT lands.
+
+One negative result worth recording: `mem` is the worst case at 243x, which
+looked like the per-access permission check scanning the region list. Caching
+the last region that answered made it very slightly *slower*. The region list
+is short and the scan is not where the time goes, so that idea is not the
+one.
+
 ## Roadmap
 
 | | | |
@@ -414,7 +468,7 @@ plausible nearby address instead of faulting.
 | M2 | SSE — done; x87 remains | partial |
 | M3 | chained fixups, binding, C thunks — done | done |
 | **M4** | **Objective-C: selectors registered, message sends into native Foundation** | **done** |
-| M5 | basic-block JIT (`MAP_JIT` + `pthread_jit_write_protect_np`) | |
+| M5 | basic-block JIT (`MAP_JIT` + `pthread_jit_write_protect_np`) | next |
 | M6 | AOT cache, trace JIT | |
 
 **M4 was the goal line, and a Foundation application now runs.** What remains

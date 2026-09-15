@@ -7,12 +7,26 @@ compatibility shim for a handful of old games, and the roughly 18,000
 Intel-only Mac applications that still exist stop launching.
 
 Rashid is a clean-room userspace translator built to keep them working. It is
-not derived from Rosetta and does not require it.
+not derived from Rosetta and does not require it — as of macOS 27, that is no
+longer a claim but an observation.
 
-> **Status: early, but it works.** Rashid runs real x86_64 Mach-O
-> executables, including Objective-C ones, sending messages into the native
-> arm64 Foundation on the machine. Coverage is far from complete — see
-> [Roadmap](#roadmap).
+> **Status: early, but it works — and it has now been shown to work without
+> Rosetta.** Upgrading the development machine to macOS 27 removed Rosetta.
+> On that machine the operating system refuses to execute an x86_64 binary at
+> all, and rashid runs one anyway:
+>
+> ```
+> $ ./objcclass.x86
+> bad CPU type in executable
+>
+> $ rashid objcclass.x86
+> hits=5      describe=clicks=5   version=1.0
+> isa=Counter responds=1          byname=Counter
+> ```
+>
+> That is an application defining its own Objective-C class, its methods
+> running in the interpreter and its messages going into the native arm64
+> Foundation. Coverage is still far from complete — see [Roadmap](#roadmap).
 
 [日本語版 README](README.ja.md)
 
@@ -344,10 +358,15 @@ prefix is what selects the instruction.
 
 ## Testing
 
-Guests are freestanding x86_64 binaries that compute something and exit with
-the answer. `make test` checks that answer twice: against a value recorded
-from real x86_64 hardware, and — while Rosetta still exists on this machine —
-against a live native run of the very same binary.
+Guests are x86_64 binaries that compute something and exit with the answer.
+`make test` checks that answer against a value recorded from real x86_64
+hardware and, where the machine can still execute x86_64, against a live
+native run of the very same binary.
+
+The fallback is no longer hypothetical. The development machine upgraded to
+macOS 27 and lost Rosetta, so every comparison now runs against recordings
+made while it was still there. `tests/expected/` holds them, and the reason
+the recordings were made early is exactly this.
 
 ```
 == behaviour (exit status must match real x86_64) ==
@@ -369,8 +388,9 @@ against a live native run of the very same binary.
 ```
 
 The live comparison is the valuable one: it checks against the actual CPU
-rather than against our belief about it. It also disappears in macOS 28,
-which is the reason this project exists — so record expected values now.
+rather than against our belief about it. It is also the thing that goes away,
+which is the reason this project exists — so record expected values while the
+hardware can still be asked.
 
 It has already earned its keep. `tests/ripimm.x86` covers a bug where a
 RIP-relative displacement combined with an immediate operand resolved four

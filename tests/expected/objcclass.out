@@ -1,0 +1,6 @@
+hits=5
+describe=clicks=5
+version=1.0
+isa=Counter
+responds=1
+byname=Counter

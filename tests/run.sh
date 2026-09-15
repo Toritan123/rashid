@@ -23,7 +23,7 @@ run_case() {
     "tests/$name.x86" >/dev/null 2>&1
     nat=$?
     case $nat in
-        126|127) nat="n/a" ;;
+        126|127) nat="n/a" ;;      # cannot execute: no Rosetta on this machine
         *) native_seen=1 ;;
     esac
 
@@ -58,12 +58,34 @@ echo
 echo "== native thunks (real binaries running through arm64 libSystem) =="
 compare() {
     name=$1
-    n_out=$("tests/$name.x86" 2>/dev/null); n=$?
     r_out=$("$BIN" "tests/$name.x86" 2>/dev/null); r=$?
-    if [ "$n_out" = "$r_out" ] && [ "$n" = "$r" ]; then
-        printf '  %-8s output and exit status match native (%s)\n' "$name" "$n"
+
+    # Prefer the hardware when it is still here. 126 and 127 mean the binary
+    # could not be executed at all, which is what the absence of Rosetta
+    # looks like.
+    "tests/$name.x86" >/dev/null 2>&1
+    case $? in
+        126|127) live=no ;;
+        *)       live=yes ;;
+    esac
+
+    if [ "$live" = yes ]; then
+        n_out=$("tests/$name.x86" 2>/dev/null); n=$?
+        native_seen=1
+        src="native"
     else
-        printf '  %-8s FAIL: native=%s rashid=%s\n' "$name" "$n" "$r"
+        n_out=$(cat "tests/expected/$name.out" 2>/dev/null); n=$(cat "tests/expected/$name.status" 2>/dev/null)
+        src="recorded"
+        if [ -z "$n" ]; then
+            printf '  %-10s FAIL: no recording and no native execution\n' "$name"
+            fail=1; return
+        fi
+    fi
+
+    if [ "$n_out" = "$r_out" ] && [ "$n" = "$r" ]; then
+        printf '  %-10s matches %s (exit %s)\n' "$name" "$src" "$n"
+    else
+        printf '  %-10s FAIL against %s: expected exit %s, got %s\n' "$name" "$src" "$n" "$r"
         diff <(printf '%s\n' "$n_out") <(printf '%s\n' "$r_out") | head -6
         fail=1
     fi
@@ -89,6 +111,10 @@ case $out in
 esac
 
 echo
-[ "$native_seen" = 1 ] || echo "note: no native x86_64 execution available; recorded values only"
+if [ "$native_seen" != 1 ]; then
+    echo "note: this machine cannot execute x86_64, so every check above used"
+    echo "      recorded values. Run softwareupdate --install-rosetta to compare"
+    echo "      against the hardware again, while that is still possible."
+fi
 if [ "$fail" = 0 ]; then echo "all tests passed"; else echo "FAILURES"; fi
 exit $fail

@@ -100,6 +100,21 @@ compare objc
 compare objcclass
 
 echo
+echo "== jit (every compiled block checked against the interpreter) =="
+for t in native varargs callback objc objcclass; do
+    [ -x "tests/$t.x86" ] || continue
+    out=$("$BIN" -J -n 0 "tests/$t.x86" 2>&1 >/dev/null)
+    blocks=$(printf '%s' "$out" | sed -n 's/.*jit: \([0-9]*\) blocks compiled.*/\1/p')
+    if printf '%s' "$out" | grep -q disagree; then
+        printf '  %-10s FAIL: jit and interpreter disagree\n' "$t"
+        printf '%s\n' "$out" | grep -A4 disagree | head -5
+        fail=1
+    else
+        printf '  %-10s %s blocks agreed with the interpreter\n' "$t" "${blocks:-0}"
+    fi
+done
+
+echo
 echo "== dynamic loading (chained fixups walked, imports resolved) =="
 out=$("$BIN" -l tests/import.x86 2>&1)
 case $out in

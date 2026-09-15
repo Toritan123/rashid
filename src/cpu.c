@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "cpu.h"
+#include "jit.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -414,6 +415,30 @@ static void do_syscall(rsd_cpu *c) {
     syscall_ret(c, ret);
 }
 
+
+// ------------------------------------------------------- shared with the JIT
+// Compiled code calls these rather than reimplementing them. Flags and memory
+// permissions are where an interpreter and a compiler most easily drift
+// apart, so there is only one copy of each.
+
+uint64_t rsd_i_ld(rsd_cpu *c, uint64_t a, uint64_t size) {
+    return ld(c, a, (int)size);
+}
+void rsd_i_st(rsd_cpu *c, uint64_t a, uint64_t v, uint64_t size) {
+    st(c, a, v, (int)size);
+}
+void rsd_i_flags_add(rsd_cpu *c, uint64_t a, uint64_t b, uint64_t r, uint64_t size) {
+    flags_add(c, a, b, r, (int)size);
+}
+void rsd_i_flags_sub(rsd_cpu *c, uint64_t a, uint64_t b, uint64_t r, uint64_t size) {
+    flags_sub(c, a, b, r, (int)size);
+}
+void rsd_i_flags_logic(rsd_cpu *c, uint64_t r, uint64_t size) {
+    flags_logic(c, r, (int)size);
+}
+uint64_t rsd_i_cond(rsd_cpu *c, uint64_t cc) {
+    return cond(c, (int)cc) ? 1 : 0;
+}
 
 // ----------------------------------------------------------------- thunks
 // Enter a native arm64 function on the guest's behalf. The two integer
@@ -1526,9 +1551,63 @@ void rsd_cpu_free(rsd_cpu *c) {
     c->stack_base = 0;
 }
 
+// Run one compiled block, and when asked, interpret the same instructions
+// from the same starting state and check that nothing differs. Compiled code
+// and the interpreter share their flag and memory routines, so what this
+// catches is a decoding or code-generation mistake, which is where a compiler
+// actually goes wrong.
+static bool run_block(rsd_cpu *c, void *body, uint32_t ninsn) {
+    if (!c->jit_check) {
+        c->rip = rsd_jit_enter(c, body);
+        c->icount += ninsn;
+        return true;
+    }
+
+    rsd_cpu before = *c;
+    c->rip = rsd_jit_enter(c, body);
+    rsd_cpu after = *c;
+
+    *c = before;
+    for (uint32_t i = 0; i < ninsn && c->running; i++) step(c);
+
+    bool ok = c->rip == after.rip && c->flags == after.flags &&
+              !memcmp(c->r, after.r, sizeof c->r);
+    if (!ok) {
+        fprintf(stderr, "rashid: jit and interpreter disagree at 0x%llx\n",
+                before.rip);
+        fprintf(stderr, "  rip   jit=0x%llx interp=0x%llx\n", after.rip, c->rip);
+        if (c->flags != after.flags)
+            fprintf(stderr, "  flags jit=0x%x interp=0x%x\n", after.flags, c->flags);
+        for (int i = 0; i < 16; i++)
+            if (c->r[i] != after.r[i])
+                fprintf(stderr, "  %-4s jit=0x%llx interp=0x%llx\n",
+                        rname[i], after.r[i], c->r[i]);
+        c->fault = "jit disagreed with the interpreter";
+        c->fault_rip = before.rip;
+        c->running = false;
+        return false;
+    }
+    c->icount += ninsn;
+    return true;
+}
+
 void rsd_cpu_run(rsd_cpu *c, uint64_t budget) {
     g_cpu = c;
     while (c->running) {
+        if (c->jit && !c->trace) {
+            void *body = rsd_jit_lookup(c->jit, c, c->rip);
+            if (body) {
+                uint32_t n = rsd_jit_count(c->jit, c->rip);
+                c->jit->executed++;
+                if (!run_block(c, body, n)) break;
+                if (budget && c->icount >= budget) {
+                    c->fault = "instruction budget exhausted";
+                    c->fault_rip = c->rip;
+                    c->running = false;
+                }
+                continue;
+            }
+        }
         if (c->trace)
             fprintf(stderr, "  %6llu  rip=0x%llx rax=0x%llx rdi=0x%llx rsp=0x%llx\n",
                     c->icount, c->rip, c->r[RAX], c->r[RDI], c->r[RSP]);

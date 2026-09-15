@@ -88,6 +88,8 @@ make test
 ./rashid -l  path/to/binary     # inspect the Mach-O, list thunk targets
 ./rashid -m  path/to/binary     # dump the guest address space map
 ./rashid -t  path/to/binary     # trace every instruction
+./rashid -j  path/to/binary     # compile basic blocks
+./rashid -J  path/to/binary     # compile, and check each block interpreted
 ```
 
 ## What works
@@ -457,6 +459,48 @@ the last region that answered made it very slightly *slower*. The region list
 is short and the scan is not where the time goes, so that idea is not the
 one.
 
+### A first block compiler
+
+`rashid -j` compiles basic blocks instead of interpreting them; `-J` does the
+same and checks every block against the interpreter before believing it.
+
+```
+work       interp       jit  speedup
+int        180.8m     74.1m    2.44x
+mem        319.1m    209.5m    1.52x
+flt        371.7m    410.4m    0.91x
+thunk      109.3m    107.5m    1.02x
+```
+
+Guest state stays in the `rsd_cpu` struct and compiled code calls back into
+the interpreter's own routines for flags and memory, so the two engines
+cannot disagree about what an instruction *means* — only about speed. What
+`-J` catches is a decoding or code-generation mistake, which is where a
+compiler actually goes wrong. Every AArch64 encoding is checked against
+clang's assembler by `make emit-test` rather than trusted.
+
+The compiler understands only register-to-register integer operations.
+Anything else ends the block, which is why `flt` loses 9%: nothing in that
+loop compiles, and the cache is still consulted. That is the honest shape of
+a first version — the useful part is the infrastructure and the check, not
+the number.
+
+Two measurements steered it. The first attempt handled only 64-bit operands
+and managed 1.22x, because blocks were two instructions long: C `int` is 32
+bits, so `mov ebx, imm32` and `cmp edi, 3` are everywhere and each ended a
+block. Adding 32-bit forms took it to 2.4x, and cost almost nothing — an
+AArch64 W-register result is zero-extended into the X register, which is
+exactly what a 32-bit x86 operation does to the upper half.
+
+The second was a mistake. Consulting the cache only at branch targets removed
+the 9% loss on `flt`, but cost `mem` a quarter of its gain, because blocks
+that begin mid-sequence stopped being found. Reverted.
+
+What would move it further, in order: memory operands, which are the largest
+coverage gap; `jcc` as a block terminator, so a loop stays in compiled code;
+guest registers held in host registers, which removes a load and a store per
+operand; and lazy flags, which removes the helper call from most arithmetic.
+
 ## Roadmap
 
 | | | |
@@ -468,7 +512,7 @@ one.
 | M2 | SSE — done; x87 remains | partial |
 | M3 | chained fixups, binding, C thunks — done | done |
 | **M4** | **Objective-C: selectors registered, message sends into native Foundation** | **done** |
-| M5 | basic-block JIT (`MAP_JIT` + `pthread_jit_write_protect_np`) | next |
+| M5 | basic-block JIT — first version, register-only integer ops | partial |
 | M6 | AOT cache, trace JIT | |
 
 **M4 was the goal line, and a Foundation application now runs.** What remains

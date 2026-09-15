@@ -17,6 +17,7 @@
 #include "as.h"
 #include "macho.h"
 #include "cpu.h"
+#include "jit.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,13 +29,16 @@ static void usage(void) {
         "  -t     trace every instruction\n"
         "  -n N   stop after N instructions (default 10000000)\n"
         "  -l     load and dump the image only, do not execute\n"
-        "  -m     dump the guest address space map after loading\n");
+        "  -m     dump the guest address space map after loading\n"
+        "  -j     compile basic blocks instead of interpreting them\n"
+        "  -J     compile, and check every block against the interpreter\n");
 }
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);   // keep host and guest writes interleaved
 
     bool trace = false, load_only = false, show_map = false;
+    bool jit = false, jit_check = false;
     uint64_t budget = 10000000;
     int i = 1;
 
@@ -42,6 +46,8 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "-t")) trace = true;
         else if (!strcmp(argv[i], "-l")) load_only = true;
         else if (!strcmp(argv[i], "-m")) show_map = true;
+        else if (!strcmp(argv[i], "-j")) jit = true;
+        else if (!strcmp(argv[i], "-J")) { jit = true; jit_check = true; }
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) budget = strtoull(argv[++i], NULL, 0);
         else { usage(); return 2; }
     }
@@ -76,12 +82,21 @@ int main(int argc, char **argv) {
     rsd_cpu cpu;
     if (rsd_cpu_init(&cpu, &as, img.entry, img.has_main, argc - i, argv + i) < 0)
         return 1;
+    rsd_jit jitstate;
+    if (jit) {
+        if (rsd_jit_init(&jitstate) < 0) return 1;
+        cpu.jit = &jitstate;
+        cpu.jit_check = jit_check;
+    }
     cpu.stubs = &stubs;
     cpu.trace = trace;
     rsd_cpu_run(&cpu, budget);
 
     if (cpu.fault) { rsd_cpu_dump(&cpu); rsd_cpu_free(&cpu); return 1; }
 
+    if (jit)
+        fprintf(stderr, "-- jit: %llu blocks compiled, %llu entered, %llu declined --\n",
+                jitstate.compiled, jitstate.executed, jitstate.bailed);
     fprintf(stderr, "-- guest exited with status %d after %llu instructions --\n",
            cpu.exit_code, cpu.icount);
     rsd_cpu_free(&cpu);

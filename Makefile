@@ -2,7 +2,7 @@ CC      ?= clang
 CFLAGS  ?= -O2 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -arch arm64
 # -lobjc: rashid registers the guest image's selectors with the native runtime.
 LDFLAGS ?= -lobjc
-SRC      = src/as.c src/macho.c src/fixups.c src/thunk.c src/objc.c src/callback.c src/cpu.c src/main.c src/callgate.S src/trampoline.S
+SRC      = src/as.c src/macho.c src/fixups.c src/thunk.c src/objc.c src/callback.c src/jit.c src/cpu.c src/main.c src/callgate.S src/trampoline.S src/jitenter.S
 BIN      = rashid
 
 .PHONY: all clean test
@@ -54,3 +54,8 @@ tests/bench.x86: tests/bench.c
 .PHONY: bench
 bench: $(BIN) tests/bench.x86 $(EXTRA)
 	@./tests/bench.sh
+
+# Encodings are checked against the assembler rather than trusted.
+.PHONY: emit-test
+emit-test: tests/emit_test.c src/emit.h
+	@$(CC) -O1 -arch arm64 -o /tmp/rsd_emit_test tests/emit_test.c && /tmp/rsd_emit_test

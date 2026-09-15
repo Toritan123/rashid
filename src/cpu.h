@@ -55,6 +55,9 @@ typedef struct {
     uint64_t gs_base;
     uint64_t fs_base;
 
+    struct rsd_jit *jit;  // compiled blocks, NULL when interpreting only
+    bool     jit_check;   // run both engines and compare
+
     rsd_as  *as;          // guest address space
     const rsd_stubs *stubs;   // imports with no thunk yet
     uint64_t stack_base;  // guest address

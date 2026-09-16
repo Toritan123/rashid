@@ -10,8 +10,12 @@
 set -u
 cd "$(dirname "$0")/.."
 SRC=src/jit.c
-GUEST=tests/jit.x86
-[ -x "$GUEST" ] || { echo "build $GUEST first"; exit 1; }
+# A mutation counts as caught if -J objects on any of these.
+GUESTS=("tests/jit.x86" "tests/jitsse.x86" "tests/bench.x86 flt 2000")
+for g in "${GUESTS[@]}"; do
+    f=${g%% *}
+    [ -x "$f" ] || { echo "build $f first"; exit 1; }
+done
 
 orig=$(mktemp)
 cp "$SRC" "$orig"
@@ -20,12 +24,16 @@ trap 'cp "$orig" "$SRC"; rm -f rashid; make -s >/dev/null 2>&1; rm -f "$orig"' E
 rebuild() { rm -f rashid; make -s >/dev/null 2>&1; }
 
 check() {   # prints "agree", "disagree" or "crashed"
-    local out st
-    out=$(./rashid -J -n 0 "$GUEST" 2>&1 >/dev/null); st=$?
-    if printf '%s' "$out" | grep -q "disagree"; then echo disagree
-    elif [ $st -ge 128 ]; then echo crashed       # a signal took rashid down
-    else echo agree
-    fi
+    local out g crashed=no
+    for g in "${GUESTS[@]}"; do
+        # shellcheck disable=SC2086
+        out=$(./rashid -J -n 0 $g 2>&1 >/dev/null)
+        if printf '%s' "$out" | grep -q "disagree"; then echo disagree; return; fi
+        # Judged by the crash reporter, not the exit status: a guest may
+        # legitimately exit with 255.
+        printf '%s' "$out" | grep -q "rashid: host SIG" && crashed=yes
+    done
+    [ $crashed = yes ] && echo crashed || echo agree
 }
 
 fail=0
@@ -65,6 +73,20 @@ mutate "push forgets to move rsp" \
   's{put\(b, a64_sub_imm\(A64_X1, A64_X1, 8\)\);\n        put\(b, a64_str\(A64_X1, CPU, off_r\(4\)\)\);\n        put\(b, a64_ldr\(A64_X2}{put(b, a64_ldr(A64_X2}s'
 mutate "cmp writes its result back" \
   's{if \(o->no_write\) return 0;}{}; s{o->no_write = \(o->op == 0x38 \|\| o->op == 0x85\);}{o->no_write = (o->op == 0x85);}'
+
+# SSE
+mutate "min returns first operand on NaN" \
+  's{a64_fcsel_d\(D0, D0, D1, A64_MI\)}{a64_fcsel_d(D0, D0, D1, 11)}'
+mutate "cmp predicate le compiled as lt" \
+  's{    A64_LS,  // 2 le}{    A64_MI,  // 2 le}'
+mutate "generated NaN keeps arm64 sign" \
+  's{b->out\[skip\] = a64_bcond\(A64_VC, b->n - skip\)}{b->out[skip] = a64_bcond(14, b->n - skip)}'
+mutate "32-bit int converted as 64-bit" \
+  's{o->isize == 8 \? a64_scvtf_dx\(D0, A64_X1\) : a64_scvtf_dw\(D0, A64_X1\)}{a64_scvtf_dx(D0, A64_X1)}'
+mutate "andnot operands swapped" \
+  's{a64_bic\(A64_X1, A64_X4, A64_X1\)}{a64_bic(A64_X1, A64_X1, A64_X4)}'
+mutate "sqrt of destination, not source" \
+  's{dbl \? a64_fsqrt_d\(D0, D1\) : a64_fsqrt_s\(D0, D1\)}{dbl ? a64_fsqrt_d(D0, D2) : a64_fsqrt_s(D0, D2)}'
 
 cp "$orig" "$SRC"
 rebuild

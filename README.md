@@ -466,10 +466,10 @@ same and replays every block through the interpreter before believing it.
 
 ```
 work      native   interp      jit  jit/interp  jit vs native
-int        14.4m   195.1m    54.1m       3.61x            18x
-mem        13.8m   368.6m    82.4m       4.48x            37x
-flt        22.0m   383.3m   463.5m       0.83x            45x
-thunk      18.7m   125.3m   108.5m       1.15x            15x
+int        14.0m   181.1m    45.0m       4.02x            17x
+mem        13.1m   322.1m    78.2m       4.12x              -
+flt        21.3m   359.7m    40.1m       8.97x             3x
+thunk      16.9m   110.4m    82.0m       1.35x            15x
 ```
 
 It compiles 32- and 64-bit integer operations with register, immediate and
@@ -479,20 +479,52 @@ their indirect forms. Guest state stays in the `rsd_cpu` struct and compiled
 code calls back into the interpreter's own routines for flags and memory, so
 the two engines cannot disagree about what an instruction *means*.
 
-`flt` got worse, and it is worth saying why: the integer parts of that loop
-now compile, but every SSE instruction ends a block, so each iteration pays
-for the trip in and out more often than it saves. SSE in the compiler is what
-fixes it. `-j` is not the default.
+Scalar SSE compiles too: moves, arithmetic, `min`/`max`, `sqrt`, all eight
+comparison predicates, `comis`, bitwise operations and the conversions.
+Before it did, `flt` ran *slower* compiled than interpreted (0.83x) — its
+integer parts compiled but every SSE instruction ended a block, so the trips
+in and out cost more than they saved. Now it is 9x faster than the
+interpreter and within 3x of Rosetta. `-j` is still not the default.
+
+#### What x86 floating point does that arm64 does not
+
+A test built from NaNs, signed zeros, infinities and out-of-range values,
+compared against native execution, found two places where the *interpreter*
+was wrong — and the compiler, faithfully matching the interpreter, was wrong
+the same way:
+
+- **The sign of a generated NaN.** When an operation creates a NaN from
+  ordinary inputs — `0/0`, `sqrt(-1)`, `inf-inf` — x86 SSE returns one with
+  the sign bit set (`0xFFF8000000000000`); arm64 returns it with the sign bit
+  clear. And when an input is already NaN, x86 returns the first operand's,
+  quieted. Both engines now follow x86, through one shared routine; compiled
+  code pays one compare and an untaken branch unless the result actually is
+  NaN.
+- **Conversions that do not fit.** `cvttsd2si` of NaN or of a value out of
+  range gives x86's "integer indefinite", `0x80000000` or
+  `0x8000000000000000`. A C cast on arm64 saturates instead, and turns NaN
+  into 0, so `(int)3e9` had been coming out as the low 32 bits of
+  3000000000.
+
+One suspicion turned out wrong and is worth recording because it looked
+right: single-precision division computed in double and then rounded to float
+is rounded twice, which can differ from dividing in single precision. It
+cannot, here. A quotient of two floats cannot land within 2⁻⁵³ of a
+single-precision rounding boundary without landing exactly on it, and 200
+million random pairs agreed.
 
 #### Checking the checker
 
 A verifier that never fails proves nothing, so `make jit-mutations` breaks
-the compiler on purpose — an index scale off by one, RIP-relative addresses
-measured from the wrong place, an inverted branch, a 32-bit add done at 64
-bits, a push that forgets to move `rsp`, a `cmp` that writes its result — and
-requires `-J` to catch every one.
+the compiler twelve ways on purpose — an index scale off by one, RIP-relative
+addresses measured from the wrong place, an inverted branch, a 32-bit add
+done at 64 bits, a push that forgets to move `rsp`, a `cmp` that writes its
+result, `min` returning the wrong operand on NaN, the `le` predicate compiled
+as `lt`, a generated NaN left with arm64's sign, a 32-bit integer converted
+as 64-bit, `andnot` with its operands swapped, `sqrt` of the wrong register —
+and requires `-J` to catch every one.
 
-Getting there turned up four things:
+Getting there turned up these, each a way a passing test was not evidence:
 
 - **Memory had to be part of the comparison.** Replaying a block that did
   `add [mem], 1` on memory the compiled block had already modified checks
@@ -514,6 +546,21 @@ Getting there turned up four things:
   wraps. Any wild pointer above the user range crashed the host instead of
   faulting. Fixed, with a fault test for it, and rashid now reports host
   crashes with the guest instruction that caused them.
+- **XMM registers were not compared.** The replay compared general
+  registers, flags and memory. The first version of the NaN fix passed its
+  helper's arguments starting at `x1`, as every other helper wants — but that
+  one takes no cpu, so it read a stray pointer as the result. Comparing XMM
+  found it immediately and named the register.
+- **16-byte stores bypassed the write log.** With `le` compiled as `lt`, the
+  wrong mask went into memory through a `movapd` store, and the register
+  holding it was overwritten before the block ended. Only 8-byte-and-smaller
+  stores were logged, so nothing compared saw it. Every store goes through the
+  log now.
+- **The test's own checksum had a blind spot.** Mixing with
+  `(h ^ v) * K` leaves a difference in the top bit in the top bit forever, and
+  an even number of them cancel. That is exactly the shape of a NaN sign
+  error in a double repeated eight times, and it hid one. The mix now shifts
+  high bits down as well.
 
 ## Roadmap
 

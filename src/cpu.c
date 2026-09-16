@@ -74,6 +74,23 @@ static const char *why(const rsd_cpu *c, uint64_t a, uint64_t n, const char *act
     return "not a usable address";
 }
 
+// Record a guest memory write while a compiled block is being checked. Every
+// store has to come through here, whatever its width: a 16-byte SSE store that
+// bypassed this once let a wrong comparison mask go unnoticed, because the
+// register holding it was overwritten before the block ended and the memory
+// holding it was never compared.
+static void log_write(rsd_cpu *c, uint64_t a, const void *h, uint64_t v, int size) {
+    struct rsd_writelog *w = c->wlog;
+    if (!w) return;
+    if (w->n >= RSD_WLOG_MAX) { w->overflow = true; return; }
+    uint64_t old = 0;
+    memcpy(&old, h, (size_t)size);
+    w->e[w->n].addr = a;  w->e[w->n].size = size;
+    w->e[w->n].old = old; w->e[w->n].val = v & (size == 8 ? ~0ull
+                                         : ((1ull << (size * 8)) - 1));
+    w->n++;
+}
+
 static uint64_t ld(rsd_cpu *c, uint64_t a, int size) {
     if (!access_ok(c, a, (uint64_t)size, RSD_PROT_R)) {
         memfault(c, a, why(c, a, (uint64_t)size, "read"));
@@ -94,19 +111,7 @@ static void st(rsd_cpu *c, uint64_t a, uint64_t v, int size) {
         return;
     }
     void *h = rsd_g2h(c->as, a);
-    if (c->wlog) {
-        struct rsd_writelog *w = c->wlog;
-        if (w->n < RSD_WLOG_MAX) {
-            uint64_t old = 0;
-            memcpy(&old, h, (size_t)size);
-            w->e[w->n].addr = a;  w->e[w->n].size = size;
-            w->e[w->n].old = old; w->e[w->n].val = v & (size == 8 ? ~0ull
-                                                   : ((1ull << (size * 8)) - 1));
-            w->n++;
-        } else {
-            w->overflow = true;
-        }
-    }
+    log_write(c, a, h, v, size);
     switch (size) {
     case 1: *(uint8_t  *)h = (uint8_t)v;  break;
     case 2: *(uint16_t *)h = (uint16_t)v; break;
@@ -624,6 +629,76 @@ static void call_native_variadic(rsd_cpu *c, void *fn, const rsd_vaspec *sp,
 }
 
 // ------------------------------------------------------------------- SSE
+// Converting floating point to an integer. A value that is NaN or does not
+// fit becomes the "integer indefinite" value, 0x80000000 or
+// 0x8000000000000000. A C cast gives something else on arm64 - it saturates,
+// and NaN becomes 0 - and the difference is observable: (int)3e9 would come
+// out as the low 32 bits of 3000000000. Shared with the JIT.
+uint64_t rsd_i_cvt2si(rsd_cpu *c, uint64_t bits, uint64_t fsize,
+                      uint64_t nearest, uint64_t isize) {
+    (void)c;
+    double v;
+    if (fsize == 8) { memcpy(&v, &bits, 8); }
+    else            { uint32_t b32 = (uint32_t)bits; float f; memcpy(&f, &b32, 4); v = f; }
+    double r = nearest ? nearbyint(v) : trunc(v);
+    if (isize == 4) {
+        if (!(r >= -2147483648.0 && r <= 2147483647.0)) return 0x80000000u;
+        return (uint32_t)(int32_t)r;
+    }
+    if (!(r >= -9223372036854775808.0 && r < 9223372036854775808.0))
+        return 0x8000000000000000ull;
+    return (uint64_t)(int64_t)r;
+}
+
+// NaN results. For arithmetic, x86 SSE returns the first operand if it is a
+// NaN, else the second, quieted either way - and when neither is, but the
+// operation itself is invalid (0/0, sqrt(-1), inf-inf), it returns a NaN with
+// the sign bit set. arm64 returns that default NaN with the sign bit clear,
+// so without this every generated NaN would differ in one bit. Shared with
+// the JIT, which calls these only when a result is actually NaN.
+uint64_t rsd_i_nan_d(uint64_t r, uint64_t first, uint64_t second, uint64_t unary) {
+    double v, f, s;
+    memcpy(&v, &r, 8);
+    if (!isnan(v)) return r;
+    memcpy(&f, &first, 8);
+    if (isnan(f)) return first | 0x0008000000000000ull;
+    memcpy(&s, &second, 8);
+    if (!unary && isnan(s)) return second | 0x0008000000000000ull;
+    return 0xFFF8000000000000ull;
+}
+
+uint64_t rsd_i_nan_s(uint64_t r, uint64_t first, uint64_t second, uint64_t unary) {
+    uint32_t r32 = (uint32_t)r, f32 = (uint32_t)first, s32 = (uint32_t)second;
+    float v, f, s;
+    memcpy(&v, &r32, 4);
+    if (!isnan(v)) return r32;
+    memcpy(&f, &f32, 4);
+    if (isnan(f)) return f32 | 0x00400000u;
+    memcpy(&s, &s32, 4);
+    if (!unary && isnan(s)) return s32 | 0x00400000u;
+    return 0xFFC00000u;
+}
+
+static double x86_nan_d(uint8_t op2, double r, double first, double second) {
+    if (op2 == 0x5D || op2 == 0x5F) return r;          // min/max never create one
+    uint64_t rb, fb, sb;
+    memcpy(&rb, &r, 8); memcpy(&fb, &first, 8); memcpy(&sb, &second, 8);
+    bool unary = (op2 == 0x51);
+    uint64_t out = rsd_i_nan_d(rb, unary ? sb : fb, sb, unary);
+    memcpy(&r, &out, 8);
+    return r;
+}
+
+static float x86_nan_s(uint8_t op2, float r, float first, float second) {
+    if (op2 == 0x5D || op2 == 0x5F) return r;
+    uint32_t rb, fb, sb;
+    memcpy(&rb, &r, 4); memcpy(&fb, &first, 4); memcpy(&sb, &second, 4);
+    bool unary = (op2 == 0x51);
+    uint32_t out = (uint32_t)rsd_i_nan_s(rb, unary ? sb : fb, sb, unary);
+    memcpy(&r, &out, 4);
+    return r;
+}
+
 // Measured against compiler-generated x86_64 code, SIMD use is overwhelmingly
 // 16-byte moves and scalar double arithmetic - movups and movaps alone are
 // three quarters of it, and packed integer SSE barely appears. XMM support is
@@ -648,7 +723,10 @@ static void st128(rsd_cpu *c, uint64_t a, const rsd_xmm *v) {
         memfault(c, a, why(c, a, 16, "write"));
         return;
     }
-    memcpy(rsd_g2h(c->as, a), v, 16);
+    void *h = rsd_g2h(c->as, a);
+    log_write(c, a,     h,                   v->q[0], 8);
+    log_write(c, a + 8, (const char *)h + 8, v->q[1], 8);
+    memcpy(h, v, 16);
 }
 
 static void xrd(rsd_cpu *c, const opnd *o, rsd_xmm *out) {
@@ -833,21 +911,25 @@ static bool sse_exec(rsd_cpu *c, dec *d, uint8_t op2, uint64_t start) {
         if (d->mand == 0xF2) {                      // scalar double
             union { uint64_t u; double f; } s;
             s.u = xrd_lo(c, &rm, 8);
-            a.lf[0] = (op2 == 0x51) ? sqrt(s.f) : fbin(op2, a.lf[0], s.f);
+            double r = (op2 == 0x51) ? sqrt(s.f) : fbin(op2, a.lf[0], s.f);
+            a.lf[0] = x86_nan_d(op2, r, a.lf[0], s.f);
         } else if (d->mand == 0xF3) {               // scalar single
             union { uint32_t u; float f; } s;
             s.u = (uint32_t)xrd_lo(c, &rm, 4);
-            a.f[0] = (op2 == 0x51) ? sqrtf(s.f)
-                                   : (float)fbin(op2, a.f[0], s.f);
+            float r = (op2 == 0x51) ? sqrtf(s.f) : (float)fbin(op2, a.f[0], s.f);
+            a.f[0] = x86_nan_s(op2, r, a.f[0], s.f);
         } else if (d->mand == 0x66) {               // packed double
             xrd(c, &rm, &b);
-            for (int i = 0; i < 2; i++)
-                a.lf[i] = (op2 == 0x51) ? sqrt(b.lf[i]) : fbin(op2, a.lf[i], b.lf[i]);
+            for (int i = 0; i < 2; i++) {
+                double r = (op2 == 0x51) ? sqrt(b.lf[i]) : fbin(op2, a.lf[i], b.lf[i]);
+                a.lf[i] = x86_nan_d(op2, r, a.lf[i], b.lf[i]);
+            }
         } else {                                    // packed single
             xrd(c, &rm, &b);
-            for (int i = 0; i < 4; i++)
-                a.f[i] = (op2 == 0x51) ? sqrtf(b.f[i])
-                                       : (float)fbin(op2, a.f[i], b.f[i]);
+            for (int i = 0; i < 4; i++) {
+                float r = (op2 == 0x51) ? sqrtf(b.f[i]) : (float)fbin(op2, a.f[i], b.f[i]);
+                a.f[i] = x86_nan_s(op2, r, a.f[i], b.f[i]);
+            }
         }
         c->xmm[reg] = a;
         return true;
@@ -889,15 +971,11 @@ static bool sse_exec(rsd_cpu *c, dec *d, uint8_t op2, uint64_t start) {
         reg = modrm(d, &rm);
         fixup_rip(d, &rm);
         c->rip = dec_rip(d);
-        double v;
-        if (d->mand == 0xF2) { union { uint64_t u; double f; } s;
-                               s.u = xrd_lo(c, &rm, 8); v = s.f; }
-        else                 { union { uint32_t u; float f; } s;
-                               s.u = (uint32_t)xrd_lo(c, &rm, 4); v = (double)s.f; }
-        // 2C truncates, 2D rounds to nearest even (the default rounding mode).
-        double r = (op2 == 0x2C) ? trunc(v) : nearbyint(v);
+        int fsize = (d->mand == 0xF2) ? 8 : 4;
+        uint64_t bits = xrd_lo(c, &rm, fsize);
         int n = (d->rex & 8) ? 8 : 4;
-        setreg(c, reg, (uint64_t)(int64_t)r, n);
+        // 2C truncates, 2D rounds to nearest even (the default rounding mode).
+        setreg(c, reg, rsd_i_cvt2si(c, bits, (uint64_t)fsize, op2 == 0x2D, (uint64_t)n), n);
         return true;
     }
 
@@ -957,6 +1035,33 @@ static bool sse_exec(rsd_cpu *c, dec *d, uint8_t op2, uint64_t start) {
         return true;
     }
 
+    // ---- interleave lanes ----
+    // unpckl/unpckh: pd and punpck*qdq on 64-bit lanes, ps on 32-bit ones.
+    // _mm_set_pd and friends compile to these, so they turn up in ordinary
+    // floating-point code, not just vector code.
+    case 0x14: case 0x15:            // unpcklp[sd] / unpckhp[sd]
+    case 0x6C: case 0x6D: {          // punpcklqdq / punpckhqdq
+        if ((op2 == 0x6C || op2 == 0x6D) && d->mand != 0x66) return false;
+        if (d->mand == 0xF2 || d->mand == 0xF3) return false;
+        reg = modrm(d, &rm);
+        fixup_rip(d, &rm);
+        c->rip = dec_rip(d);
+        xrd(c, &rm, &b);
+        a = c->xmm[reg];
+        bool high = (op2 == 0x15 || op2 == 0x6D);
+        if (d->mand == 0x66) {                       // 64-bit lanes
+            if (high) { a.q[0] = a.q[1]; a.q[1] = b.q[1]; }
+            else      {                  a.q[1] = b.q[0]; }
+        } else {                                     // 32-bit lanes (ps)
+            rsd_xmm r;
+            if (high) { r.d[0] = a.d[2]; r.d[1] = b.d[2]; r.d[2] = a.d[3]; r.d[3] = b.d[3]; }
+            else      { r.d[0] = a.d[0]; r.d[1] = b.d[0]; r.d[2] = a.d[1]; r.d[3] = b.d[1]; }
+            a = r;
+        }
+        c->xmm[reg] = a;
+        return true;
+    }
+
     case 0xC2: {                     // cmpps / cmppd / cmpss / cmpsd
         reg = modrm(d, &rm);
         uint8_t imm = fetch8(d);
@@ -1001,6 +1106,28 @@ static bool sse_exec(rsd_cpu *c, dec *d, uint8_t op2, uint64_t start) {
     (void)start;
 }
 
+// SSE pieces the JIT calls, defined here so they sit next to what they wrap.
+void rsd_i_ld128(rsd_cpu *c, uint64_t a, uint64_t *out) {
+    rsd_xmm v;
+    ld128(c, a, &v);
+    memcpy(out, &v, 16);
+}
+void rsd_i_st128(rsd_cpu *c, uint64_t a, const uint64_t *in) {
+    rsd_xmm v;
+    memcpy(&v, in, 16);
+    st128(c, a, &v);
+}
+void rsd_i_comisd(rsd_cpu *c, uint64_t a, uint64_t b) {
+    double x, y;
+    memcpy(&x, &a, 8); memcpy(&y, &b, 8);
+    comis(c, x, y);
+}
+void rsd_i_comiss(rsd_cpu *c, uint64_t a, uint64_t b) {
+    uint32_t a32 = (uint32_t)a, b32 = (uint32_t)b;
+    float x, y;
+    memcpy(&x, &a32, 4); memcpy(&y, &b32, 4);
+    comis(c, (double)x, (double)y);
+}
 // ------------------------------------------------------------------ core
 // The interpreter is single-threaded, and a callback always happens inside a
 // native call that the interpreter itself made, so the running machine can be
@@ -1631,7 +1758,8 @@ static bool run_block(rsd_cpu *c, void *body, uint32_t ninsn) {
     bool ok = both_faulted ||
               (!after.fault && !c->fault &&
                c->rip == after.rip && c->flags == after.flags &&
-               !memcmp(c->r, after.r, sizeof c->r));
+               !memcmp(c->r, after.r, sizeof c->r) &&
+               !memcmp(c->xmm, after.xmm, sizeof c->xmm));
     bool mem_ok = jit_log.overflow || int_log.overflow ||
                   (jit_log.n == int_log.n);
     for (int i = 0; mem_ok && !jit_log.overflow && i < jit_log.n; i++)
@@ -1651,6 +1779,10 @@ static bool run_block(rsd_cpu *c, void *body, uint32_t ninsn) {
             if (c->r[i] != after.r[i])
                 fprintf(stderr, "  %-4s jit=0x%llx interp=0x%llx\n",
                         rname[i], after.r[i], c->r[i]);
+        for (int i = 0; i < 16; i++)
+            if (memcmp(&c->xmm[i], &after.xmm[i], 16))
+                fprintf(stderr, "  xmm%-2d jit=%016llx%016llx interp=%016llx%016llx\n", i,
+                        after.xmm[i].q[1], after.xmm[i].q[0], c->xmm[i].q[1], c->xmm[i].q[0]);
         if (!mem_ok) {
             fprintf(stderr, "  memory writes jit=%d interp=%d\n", jit_log.n, int_log.n);
             int m = jit_log.n > int_log.n ? jit_log.n : int_log.n;

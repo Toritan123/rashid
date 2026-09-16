@@ -36,6 +36,13 @@ void     rsd_i_flags_add(rsd_cpu *, uint64_t, uint64_t, uint64_t, uint64_t);
 void     rsd_i_flags_sub(rsd_cpu *, uint64_t, uint64_t, uint64_t, uint64_t);
 void     rsd_i_flags_logic(rsd_cpu *, uint64_t, uint64_t);
 uint64_t rsd_i_cond(rsd_cpu *, uint64_t);
+void     rsd_i_ld128(rsd_cpu *, uint64_t, uint64_t *);
+void     rsd_i_st128(rsd_cpu *, uint64_t, const uint64_t *);
+void     rsd_i_comisd(rsd_cpu *, uint64_t, uint64_t);
+void     rsd_i_comiss(rsd_cpu *, uint64_t, uint64_t);
+uint64_t rsd_i_cvt2si(rsd_cpu *, uint64_t, uint64_t, uint64_t, uint64_t);
+uint64_t rsd_i_nan_d(uint64_t, uint64_t, uint64_t, uint64_t);
+uint64_t rsd_i_nan_s(uint64_t, uint64_t, uint64_t, uint64_t);
 void     rsd_i_flags_inc(rsd_cpu *, uint64_t, uint64_t, uint64_t);
 void     rsd_i_flags_dec(rsd_cpu *, uint64_t, uint64_t, uint64_t);
 
@@ -70,6 +77,7 @@ static void put_call(buf *b, void *fn) {
 // Offsets into rsd_cpu, checked once in rsd_jit_init.
 static uint32_t off_r(int r)   { return (uint32_t)(offsetof(rsd_cpu, r) + (size_t)r * 8); }
 static uint32_t off_tmp(int i) { return (uint32_t)(offsetof(rsd_cpu, jit_tmp) + (size_t)i * 8); }
+static uint32_t off_xmm(int i) { return (uint32_t)(offsetof(rsd_cpu, xmm) + (size_t)i * 16); }
 #define OFF_CURRIP  ((uint32_t)offsetof(rsd_cpu, cur_rip))
 #define OFF_RUNNING ((uint32_t)offsetof(rsd_cpu, running))
 
@@ -104,7 +112,7 @@ static void put_leave(buf *b) {
 // Pseudo-opcodes for operations that have no ALU row of their own.
 enum { OP_INC = 0x100, OP_DEC = 0x101 };
 
-enum { K_RR = 1, K_RI, K_RM, K_MR, K_MI, K_LEA, K_PUSH, K_POP, K_NOP,
+enum { K_RR = 1, K_RI, K_RM, K_MR, K_MI, K_LEA, K_PUSH, K_POP, K_NOP, K_SSE,
        K_JCC, K_JMP, K_CALL, K_RET, K_CALLM, K_JMPM };
 
 typedef struct {
@@ -117,6 +125,9 @@ typedef struct {
     bool     no_write;
     int      cc;
     uint64_t next, target;
+    // SSE: mandatory prefix, second opcode byte, xmm destination, xmm or
+    // general register source, integer width for conversions, cmp predicate
+    int      mand, op2, xreg, xsrc, isize, pred;
 } insn;
 
 static bool terminates(int kind) { return kind >= K_JCC; }
@@ -144,14 +155,58 @@ static void modrm_mem(const uint8_t *p, int *n, uint8_t rex, uint8_t m, insn *o)
     else if (mod == 2) { memcpy(&d32, p + *n, 4); *n += 4; o->disp += d32; }
 }
 
+// The SSE subset: what compiled x86_64 code actually uses in scalar
+// floating-point work. Each accepts only the prefixes the interpreter treats
+// the same way; anything ambiguous is left to the interpreter.
+static bool decode_sse(const uint8_t *p, int *n, uint8_t rex, uint8_t mand,
+                       uint8_t op2, insn *o) {
+    bool scalar = (mand == 0xF2 || mand == 0xF3);
+    bool packed = (mand == 0x00 || mand == 0x66);
+    switch (op2) {
+    case 0x10: case 0x11:                        // movs[sd] / movup[sd]
+        break;
+    case 0x28: case 0x29:                        // movap[sd]
+    case 0x54: case 0x55: case 0x56: case 0x57:  // and / andn / or / xor
+    case 0x2E: case 0x2F:                        // ucomis / comis
+        if (!packed) return false;
+        break;
+    case 0xDB: case 0xEB: case 0xEF:             // pand / por / pxor
+        if (mand != 0x66) return false;
+        break;
+    case 0x51: case 0x58: case 0x59: case 0x5C:
+    case 0x5D: case 0x5E: case 0x5F:             // scalar arithmetic
+    case 0xC2:                                   // cmps[sd]
+    case 0x2A: case 0x2C: case 0x2D: case 0x5A:  // conversions
+        if (!scalar) return false;
+        break;
+    default:
+        return false;
+    }
+
+    uint8_t m = p[(*n)++];
+    o->kind = K_SSE;
+    o->mand = mand;
+    o->op2 = op2;
+    o->isize = (rex & 8) ? 8 : 4;
+    o->xreg = ((m >> 3) & 7) | ((rex & 4) ? 8 : 0);
+    if ((m >> 6) == 3) o->xsrc = (m & 7) | ((rex & 1) ? 8 : 0);
+    else               modrm_mem(p, n, rex, m, o);
+    if (op2 == 0xC2) o->pred = p[(*n)++] & 7;
+    return true;
+}
+
 static int decode(const uint8_t *p, uint64_t rip, insn *o) {
     memset(o, 0, sizeof *o);
     int n = 0;
-    uint8_t rex = 0;
+    uint8_t rex = 0, mand = 0;
+    // A 66/F2/F3 prefix selects an SSE instruction; on anything else it is an
+    // operand-size or rep prefix, which the compiler does not handle.
+    if (p[n] == 0x66 || p[n] == 0xF2 || p[n] == 0xF3) mand = p[n++];
     if ((p[n] & 0xF0) == 0x40) rex = p[n++];
     o->size = (rex & 8) ? 8 : 4;
     uint8_t op = p[n++], m;
     int32_t d32;
+    if (mand && op != 0x0F) return 0;
 
     switch (op) {
     case 0x01: case 0x03: case 0x09: case 0x0B:
@@ -236,14 +291,16 @@ static int decode(const uint8_t *p, uint64_t rip, insn *o) {
     case 0x0F: {
         uint8_t op2 = p[n++];
         if (op2 >= 0x80 && op2 <= 0x8F) {
+            if (mand) return 0;
             o->kind = K_JCC; o->cc = op2 & 0xF;
             memcpy(&d32, p + n, 4); n += 4; o->imm = (uint64_t)(int64_t)d32;
         } else if (op2 == 0x1F) {                   // multi-byte nop
+            if (mand && mand != 0x66) return 0;
             m = p[n++];
             if ((m >> 6) != 3) modrm_mem(p, &n, rex, m, o);
             o->mem = false;
             o->kind = K_NOP;
-        } else {
+        } else if (!decode_sse(p, &n, rex, mand, op2, o)) {
             return 0;
         }
         break;
@@ -356,10 +413,251 @@ static void put_store(buf *b, int size) {       // x1 = address, x2 = value
     put_fault_check(b);
 }
 
+// --- SSE code generation ---------------------------------------------
+// Guest XMM registers live in rsd_cpu; d0/s0 hold the destination lane and
+// d1/s1 the source while an instruction is computed. Helper calls clobber
+// every low FP register, so a memory source is fetched before the
+// destination is loaded.
+
+#define D0 0
+#define D1 1
+#define D2 2
+
+// Which AArch64 condition gives each CMPSD/CMPSS predicate after fcmp. An
+// unordered comparison sets C and V, which is what makes these line up.
+static const int cmp_cond[8] = {
+    A64_EQ,  // 0 eq, ordered
+    A64_MI,  // 1 lt
+    A64_LS,  // 2 le
+    A64_VS,  // 3 unord
+    A64_NE,  // 4 neq, unordered
+    A64_PL,  // 5 nlt
+    A64_HI,  // 6 nle
+    A64_VC,  // 7 ord
+};
+
+static void put_fsrc(buf *b, const insn *o, uint64_t rip, bool dbl) {
+    if (!o->mem) {
+        put(b, dbl ? a64_ldr_d(D1, CPU, off_xmm(o->xsrc)) : a64_ldr_s(D1, CPU, off_xmm(o->xsrc)));
+        return;
+    }
+    put_set_rip(b, rip);
+    put_ea(b, o);
+    put_load(b, dbl ? 8 : 4);
+    put(b, dbl ? a64_fmov_dx(D1, A64_X0) : a64_fmov_sw(D1, A64_X0));
+}
+
+static void put_sse(buf *b, const insn *o, uint64_t rip) {
+    bool dbl = (o->mand == 0xF2);
+    uint32_t dst = off_xmm(o->xreg);
+
+    switch (o->op2) {
+
+    case 0x10: case 0x11:
+        if (o->mand == 0xF2 || o->mand == 0xF3) {       // movsd / movss
+            int nb = (o->mand == 0xF2) ? 8 : 4;
+            bool store = (o->op2 == 0x11);
+            if (!o->mem) {
+                // Register to register replaces only the low lane.
+                uint32_t from = store ? dst : off_xmm(o->xsrc);
+                uint32_t to   = store ? off_xmm(o->xsrc) : dst;
+                if (nb == 8) { put(b, a64_ldr(A64_X1, CPU, from)); put(b, a64_str(A64_X1, CPU, to)); }
+                else         { put(b, a64_ldr_w(A64_X1, CPU, from)); put(b, a64_str_w(A64_X1, CPU, to)); }
+                return;
+            }
+            put_set_rip(b, rip);
+            put_ea(b, o);
+            if (store) {
+                put(b, a64_ldr(A64_X2, CPU, dst));
+                put_store(b, nb);
+                return;
+            }
+            put_load(b, nb);                            // from memory: rest zeroed
+            put(b, a64_str(A64_X0, CPU, dst));
+            put(b, a64_str(A64_ZR, CPU, dst + 8));
+            return;
+        }
+        /* fall through: movups / movupd */
+    case 0x28: case 0x29: {                             // 128-bit copies
+        bool store = (o->op2 & 1);
+        if (!o->mem) {
+            uint32_t from = store ? dst : off_xmm(o->xsrc);
+            uint32_t to   = store ? off_xmm(o->xsrc) : dst;
+            put(b, a64_ldr(A64_X1, CPU, from));
+            put(b, a64_ldr(A64_X2, CPU, from + 8));
+            put(b, a64_str(A64_X1, CPU, to));
+            put(b, a64_str(A64_X2, CPU, to + 8));
+            return;
+        }
+        put_set_rip(b, rip);
+        put_ea(b, o);
+        put(b, a64_add_imm(A64_X2, CPU, dst));
+        put(b, a64_mov(A64_X0, CPU));
+        put_call(b, store ? (void *)rsd_i_st128 : (void *)rsd_i_ld128);
+        put_fault_check(b);
+        return;
+    }
+
+    case 0x54: case 0x55: case 0x56: case 0x57:
+    case 0xDB: case 0xEB: case 0xEF: {                  // 128-bit bitwise
+        if (o->mem) {
+            put_set_rip(b, rip);
+            put_ea(b, o);
+            put(b, a64_add_imm(A64_X2, CPU, off_tmp(0)));
+            put(b, a64_mov(A64_X0, CPU));
+            put_call(b, rsd_i_ld128);
+            put_fault_check(b);
+            put(b, a64_ldr(A64_X4, CPU, off_tmp(0)));
+            put(b, a64_ldr(A64_X5, CPU, off_tmp(1)));
+        } else {
+            put(b, a64_ldr(A64_X4, CPU, off_xmm(o->xsrc)));
+            put(b, a64_ldr(A64_X5, CPU, off_xmm(o->xsrc) + 8));
+        }
+        put(b, a64_ldr(A64_X1, CPU, dst));
+        put(b, a64_ldr(A64_X2, CPU, dst + 8));
+        switch (o->op2) {
+        case 0x54: case 0xDB: put(b, a64_and(A64_X1, A64_X1, A64_X4)); put(b, a64_and(A64_X2, A64_X2, A64_X5)); break;
+        case 0x55:            put(b, a64_bic(A64_X1, A64_X4, A64_X1)); put(b, a64_bic(A64_X2, A64_X5, A64_X2)); break;
+        case 0x56: case 0xEB: put(b, a64_orr(A64_X1, A64_X1, A64_X4)); put(b, a64_orr(A64_X2, A64_X2, A64_X5)); break;
+        default:              put(b, a64_eor(A64_X1, A64_X1, A64_X4)); put(b, a64_eor(A64_X2, A64_X2, A64_X5)); break;
+        }
+        put(b, a64_str(A64_X1, CPU, dst));
+        put(b, a64_str(A64_X2, CPU, dst + 8));
+        return;
+    }
+
+    case 0x51: case 0x58: case 0x59: case 0x5C:
+    case 0x5D: case 0x5E: case 0x5F: {                  // scalar arithmetic
+        put_fsrc(b, o, rip, dbl);
+        if (o->op2 != 0x51) {
+            put(b, dbl ? a64_ldr_d(D0, CPU, dst) : a64_ldr_s(D0, CPU, dst));
+            put(b, dbl ? a64_ldr_d(D2, CPU, dst) : a64_ldr_s(D2, CPU, dst));  // first operand, kept
+        }
+        switch (o->op2) {
+        case 0x58: put(b, dbl ? a64_fop_d(FOP_ADD, D0, D0, D1) : a64_fop_s(FOP_ADD, D0, D0, D1)); break;
+        case 0x59: put(b, dbl ? a64_fop_d(FOP_MUL, D0, D0, D1) : a64_fop_s(FOP_MUL, D0, D0, D1)); break;
+        case 0x5C: put(b, dbl ? a64_fop_d(FOP_SUB, D0, D0, D1) : a64_fop_s(FOP_SUB, D0, D0, D1)); break;
+        case 0x5E: put(b, dbl ? a64_fop_d(FOP_DIV, D0, D0, D1) : a64_fop_s(FOP_DIV, D0, D0, D1)); break;
+        case 0x51: put(b, dbl ? a64_fsqrt_d(D0, D1) : a64_fsqrt_s(D0, D1)); break;
+        // min and max return the second operand when the inputs are
+        // unordered or equal; mi and gt are both false for unordered.
+        case 0x5D: put(b, dbl ? a64_fcmp_d(D0, D1) : a64_fcmp_s(D0, D1));
+                   put(b, dbl ? a64_fcsel_d(D0, D0, D1, A64_MI) : a64_fcsel_s(D0, D0, D1, A64_MI)); break;
+        case 0x5F: put(b, dbl ? a64_fcmp_d(D0, D1) : a64_fcmp_s(D0, D1));
+                   put(b, dbl ? a64_fcsel_d(D0, D0, D1, A64_GT) : a64_fcsel_s(D0, D0, D1, A64_GT)); break;
+        }
+        if (o->op2 != 0x5D && o->op2 != 0x5F) {
+            // Only a NaN result can differ from x86, so the common path is
+            // one compare and a branch not taken.
+            put(b, dbl ? a64_fcmp_d(D0, D0) : a64_fcmp_s(D0, D0));
+            int skip = b->n;
+            put(b, a64_bcond(A64_VC, 0));
+            bool unary = (o->op2 == 0x51);
+            // rsd_i_nan_* take no cpu, so their arguments start at x0 -
+            // unlike every other helper here, which is exactly the mistake
+            // the first version of this made.
+            if (dbl) {
+                put(b, a64_fmov_xd(A64_X0, D0));
+                put(b, a64_fmov_xd(A64_X1, unary ? D1 : D2));
+                put(b, a64_fmov_xd(A64_X2, D1));
+            } else {
+                put(b, a64_fmov_ws(A64_X0, D0));
+                put(b, a64_fmov_ws(A64_X1, unary ? D1 : D2));
+                put(b, a64_fmov_ws(A64_X2, D1));
+            }
+            put_imm(b, A64_X3, unary ? 1 : 0);
+            put_call(b, dbl ? (void *)rsd_i_nan_d : (void *)rsd_i_nan_s);
+            put(b, dbl ? a64_fmov_dx(D0, A64_X0) : a64_fmov_sw(D0, A64_X0));
+            if (!b->full) b->out[skip] = a64_bcond(A64_VC, b->n - skip);
+        }
+        put(b, dbl ? a64_str_d(D0, CPU, dst) : a64_str_s(D0, CPU, dst));
+        return;
+    }
+
+    case 0xC2:                                          // cmpsd / cmpss
+        put_fsrc(b, o, rip, dbl);
+        put(b, dbl ? a64_ldr_d(D0, CPU, dst) : a64_ldr_s(D0, CPU, dst));
+        put(b, dbl ? a64_fcmp_d(D0, D1) : a64_fcmp_s(D0, D1));
+        if (dbl) { put(b, a64_csetm(A64_X3, cmp_cond[o->pred]));   put(b, a64_str(A64_X3, CPU, dst)); }
+        else     { put(b, a64_csetm_w(A64_X3, cmp_cond[o->pred])); put(b, a64_str_w(A64_X3, CPU, dst)); }
+        return;
+
+    case 0x2E: case 0x2F: {                             // ucomis / comis
+        bool d64 = (o->mand == 0x66);
+        if (o->mem) {
+            put_set_rip(b, rip);
+            put_ea(b, o);
+            put_load(b, d64 ? 8 : 4);
+            put(b, a64_mov(A64_X2, A64_X0));
+        } else {
+            put(b, d64 ? a64_ldr(A64_X2, CPU, off_xmm(o->xsrc)) : a64_ldr_w(A64_X2, CPU, off_xmm(o->xsrc)));
+        }
+        put(b, d64 ? a64_ldr(A64_X1, CPU, dst) : a64_ldr_w(A64_X1, CPU, dst));
+        put(b, a64_mov(A64_X0, CPU));
+        put_call(b, d64 ? (void *)rsd_i_comisd : (void *)rsd_i_comiss);
+        return;
+    }
+
+    case 0x2A: {                                        // cvtsi2sd / cvtsi2ss
+        int src_gp = o->xsrc;                           // a general register here
+        if (o->mem) {
+            put_set_rip(b, rip);
+            put_ea(b, o);
+            put_load(b, o->isize);
+            put(b, a64_mov(A64_X1, A64_X0));
+        } else {
+            put(b, a64_ldr(A64_X1, CPU, off_r(src_gp)));
+        }
+        if (dbl) put(b, o->isize == 8 ? a64_scvtf_dx(D0, A64_X1) : a64_scvtf_dw(D0, A64_X1));
+        else     put(b, o->isize == 8 ? a64_scvtf_sx(D0, A64_X1) : a64_scvtf_sw(D0, A64_X1));
+        put(b, dbl ? a64_str_d(D0, CPU, dst) : a64_str_s(D0, CPU, dst));
+        return;
+    }
+
+    case 0x2C: case 0x2D: {                             // cvt(t)s[sd]2si
+        // Out-of-range results follow x86, not a C cast, so this goes through
+        // the same routine the interpreter uses.
+        int fsize = dbl ? 8 : 4;
+        if (o->mem) {
+            put_set_rip(b, rip);
+            put_ea(b, o);
+            put_load(b, fsize);
+            put(b, a64_mov(A64_X1, A64_X0));
+        } else {
+            put(b, a64_ldr(A64_X1, CPU, off_xmm(o->xsrc)));
+        }
+        put(b, a64_mov(A64_X0, CPU));
+        put_imm(b, A64_X2, (uint64_t)fsize);
+        put_imm(b, A64_X3, o->op2 == 0x2D ? 1 : 0);
+        put_imm(b, A64_X4, (uint64_t)o->isize);
+        put_call(b, rsd_i_cvt2si);
+        put(b, a64_str(A64_X0, CPU, off_r(o->xreg)));   // xreg is the integer destination
+        return;
+    }
+
+    case 0x5A:                                          // cvtss2sd / cvtsd2ss
+        if (dbl) {                                      // double -> single
+            put_fsrc(b, o, rip, true);
+            put(b, a64_fcvt_sd(D0, D1));
+            put(b, a64_str_s(D0, CPU, dst));
+        } else {                                        // single -> double
+            put_fsrc(b, o, rip, false);
+            put(b, a64_fcvt_ds(D0, D1));
+            put(b, a64_str_d(D0, CPU, dst));
+        }
+        return;
+    }
+    b->full = true;
+}
+
 static void put_insn(buf *b, const insn *o, uint64_t rip) {
     void *fl;
     switch (o->kind) {
     case K_NOP:
+        return;
+
+    case K_SSE:
+        put_sse(b, o, rip);
         return;
 
     case K_RR:
@@ -512,7 +810,8 @@ int rsd_jit_init(rsd_jit *j) {
     j->size = ARENA;
     // Compiled code addresses rsd_cpu fields with scaled 12-bit offsets.
     if (off_r(15) >= 32768 || OFF_CURRIP % 8 || OFF_CURRIP >= 32768 ||
-        off_tmp(3) >= 32768 || OFF_RUNNING >= 4096) {
+        off_tmp(3) >= 4096 || OFF_RUNNING >= 4096 ||
+        off_xmm(0) % 8 || off_xmm(15) + 8 >= 4096) {
         fprintf(stderr, "rashid: rsd_cpu layout is out of reach of the jit\n");
         return -1;
     }

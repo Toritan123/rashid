@@ -22,6 +22,7 @@
 //   (none)  read through a NULL guest pointer
 //   w       write into the guest's own read-only __TEXT
 //   f       jump far outside the guest address space
+//   r       read through a pointer beyond any user address
 static long sys3(long n, long a, long b, long c) {
     long ret;
     __asm__ volatile("syscall" : "=a"(ret)
@@ -34,6 +35,11 @@ int start(int argc, char **argv) {
 
     if (mode == 'w') {
         *(volatile long *)start = 0;              // write to read-only __TEXT
+    } else if (mode == 'r') {
+        // Non-canonical. This once crashed rashid: the bound check subtracted
+        // the address from the ceiling before comparing it, and wrapped.
+        volatile long v = *(volatile long *)0xe6ba23d000000001UL;
+        (void)v;
     } else if (mode == 'f') {
         ((void (*)(void))0x7fffffffffff0000UL)();  // jump out of guest space
     } else {

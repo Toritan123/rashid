@@ -61,7 +61,10 @@ static void memfault(rsd_cpu *c, uint64_t a, const char *what) {
 static bool access_ok(const rsd_cpu *c, uint64_t a, uint64_t n, int prot) {
     if (rsd_as_ok(c->as, a, n, prot)) return true;
     if (rsd_as_mapped(c->as, a, n)) return false;   // ours, but not permitted
-    return a >= RSD_MIN_VALID && n <= RSD_MAX_VALID - a;
+    // a must be checked against the ceiling before it is subtracted from it:
+    // with a above RSD_MAX_VALID the subtraction wraps, the bound becomes
+    // enormous, and a wild pointer is waved through to crash the host.
+    return a >= RSD_MIN_VALID && a < RSD_MAX_VALID && n <= RSD_MAX_VALID - a;
 }
 
 static const char *why(const rsd_cpu *c, uint64_t a, uint64_t n, const char *act) {
@@ -91,6 +94,19 @@ static void st(rsd_cpu *c, uint64_t a, uint64_t v, int size) {
         return;
     }
     void *h = rsd_g2h(c->as, a);
+    if (c->wlog) {
+        struct rsd_writelog *w = c->wlog;
+        if (w->n < RSD_WLOG_MAX) {
+            uint64_t old = 0;
+            memcpy(&old, h, (size_t)size);
+            w->e[w->n].addr = a;  w->e[w->n].size = size;
+            w->e[w->n].old = old; w->e[w->n].val = v & (size == 8 ? ~0ull
+                                                   : ((1ull << (size * 8)) - 1));
+            w->n++;
+        } else {
+            w->overflow = true;
+        }
+    }
     switch (size) {
     case 1: *(uint8_t  *)h = (uint8_t)v;  break;
     case 2: *(uint16_t *)h = (uint16_t)v; break;
@@ -435,6 +451,17 @@ void rsd_i_flags_sub(rsd_cpu *c, uint64_t a, uint64_t b, uint64_t r, uint64_t si
 }
 void rsd_i_flags_logic(rsd_cpu *c, uint64_t r, uint64_t size) {
     flags_logic(c, r, (int)size);
+}
+// inc and dec set flags like add and sub, except that CF is left alone.
+void rsd_i_flags_inc(rsd_cpu *c, uint64_t a, uint64_t r, uint64_t size) {
+    uint32_t cf = c->flags & F_CF;
+    flags_add(c, a, 1, r, (int)size);
+    c->flags = (c->flags & ~F_CF) | cf;
+}
+void rsd_i_flags_dec(rsd_cpu *c, uint64_t a, uint64_t r, uint64_t size) {
+    uint32_t cf = c->flags & F_CF;
+    flags_sub(c, a, 1, r, (int)size);
+    c->flags = (c->flags & ~F_CF) | cf;
 }
 uint64_t rsd_i_cond(rsd_cpu *c, uint64_t cc) {
     return cond(c, (int)cc) ? 1 : 0;
@@ -1152,7 +1179,10 @@ static void step(rsd_cpu *c) {
     case 0x14: case 0x15: case 0x1C: case 0x1D: {
         bool byte = !(op & 1);
         if (byte) sz = 1;
-        uint64_t b = byte ? fetch8(&d) : (uint64_t)(int64_t)(int32_t)fetch32(&d);
+        // With a 0x66 prefix the immediate is 16 bits, not 32.
+        uint64_t b = byte ? fetch8(&d)
+                   : sz == 2 ? fetch16(&d)
+                   : (uint64_t)(int64_t)(int32_t)fetch32(&d);
         ADVANCE();
         uint64_t a = getreg(c, RAX, sz), r;
         switch (op & ~7) {
@@ -1169,6 +1199,17 @@ static void step(rsd_cpu *c) {
         case 0x30: r = a ^ b; flags_logic(c, r, sz);     setreg(c, RAX, r, sz); break;
         default:   r = a - b; flags_sub(c, a, b, r, sz); break; // cmp
         }
+        return;
+    }
+
+    // ---- test al/ax/eax/rax, imm ----
+    case 0xA8: case 0xA9: {
+        if (op == 0xA8) sz = 1;
+        uint64_t b = (op == 0xA8) ? fetch8(&d)
+                   : sz == 2 ? fetch16(&d)
+                   : (uint64_t)(int64_t)(int32_t)fetch32(&d);
+        ADVANCE();
+        flags_logic(c, getreg(c, RAX, sz) & b, sz);
         return;
     }
 
@@ -1556,6 +1597,11 @@ void rsd_cpu_free(rsd_cpu *c) {
 // and the interpreter share their flag and memory routines, so what this
 // catches is a decoding or code-generation mistake, which is where a compiler
 // actually goes wrong.
+static void undo_writes(const struct rsd_writelog *w) {
+    for (int i = w->n - 1; i >= 0; i--)
+        memcpy((void *)(uintptr_t)w->e[i].addr, &w->e[i].old, (size_t)w->e[i].size);
+}
+
 static bool run_block(rsd_cpu *c, void *body, uint32_t ninsn) {
     if (!c->jit_check) {
         c->rip = rsd_jit_enter(c, body);
@@ -1563,18 +1609,41 @@ static bool run_block(rsd_cpu *c, void *body, uint32_t ninsn) {
         return true;
     }
 
+    static struct rsd_writelog jit_log, int_log;
     rsd_cpu before = *c;
+
+    jit_log.n = 0; jit_log.overflow = false;
+    c->wlog = &jit_log;
     c->rip = rsd_jit_enter(c, body);
+    c->wlog = NULL;
     rsd_cpu after = *c;
 
+    // Put memory back the way the block found it, then replay.
+    undo_writes(&jit_log);
     *c = before;
-    for (uint32_t i = 0; i < ninsn && c->running; i++) step(c);
+    int_log.n = 0; int_log.overflow = false;
+    c->wlog = &int_log;
+    uint32_t done = 0;
+    while (done < ninsn && c->running) { step(c); done++; }
+    c->wlog = NULL;
 
-    bool ok = c->rip == after.rip && c->flags == after.flags &&
-              !memcmp(c->r, after.r, sizeof c->r);
-    if (!ok) {
-        fprintf(stderr, "rashid: jit and interpreter disagree at 0x%llx\n",
-                before.rip);
+    bool both_faulted = after.fault && c->fault;
+    bool ok = both_faulted ||
+              (!after.fault && !c->fault &&
+               c->rip == after.rip && c->flags == after.flags &&
+               !memcmp(c->r, after.r, sizeof c->r));
+    bool mem_ok = jit_log.overflow || int_log.overflow ||
+                  (jit_log.n == int_log.n);
+    for (int i = 0; mem_ok && !jit_log.overflow && i < jit_log.n; i++)
+        mem_ok = jit_log.e[i].addr == int_log.e[i].addr &&
+                 jit_log.e[i].size == int_log.e[i].size &&
+                 jit_log.e[i].val  == int_log.e[i].val;
+
+    if (!ok || !mem_ok) {
+        fprintf(stderr, "rashid: jit and interpreter disagree at 0x%llx\n", before.rip);
+        if (after.fault || c->fault)
+            fprintf(stderr, "  fault jit=%s interp=%s\n",
+                    after.fault ? after.fault : "-", c->fault ? c->fault : "-");
         fprintf(stderr, "  rip   jit=0x%llx interp=0x%llx\n", after.rip, c->rip);
         if (c->flags != after.flags)
             fprintf(stderr, "  flags jit=0x%x interp=0x%x\n", after.flags, c->flags);
@@ -1582,6 +1651,21 @@ static bool run_block(rsd_cpu *c, void *body, uint32_t ninsn) {
             if (c->r[i] != after.r[i])
                 fprintf(stderr, "  %-4s jit=0x%llx interp=0x%llx\n",
                         rname[i], after.r[i], c->r[i]);
+        if (!mem_ok) {
+            fprintf(stderr, "  memory writes jit=%d interp=%d\n", jit_log.n, int_log.n);
+            int m = jit_log.n > int_log.n ? jit_log.n : int_log.n;
+            for (int i = 0; i < m && i < 8; i++)
+                fprintf(stderr, "    [%d] jit %s  interp %s\n", i,
+                        i < jit_log.n ? "write" : "-", i < int_log.n ? "write" : "-");
+            for (int i = 0; i < m && i < 8; i++) {
+                if (i < jit_log.n)
+                    fprintf(stderr, "    jit    0x%llx/%d = 0x%llx\n", jit_log.e[i].addr,
+                            jit_log.e[i].size, jit_log.e[i].val);
+                if (i < int_log.n)
+                    fprintf(stderr, "    interp 0x%llx/%d = 0x%llx\n", int_log.e[i].addr,
+                            int_log.e[i].size, int_log.e[i].val);
+            }
+        }
         c->fault = "jit disagreed with the interpreter";
         c->fault_rip = before.rip;
         c->running = false;

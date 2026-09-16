@@ -45,7 +45,7 @@ run_case vm     9
 
 echo
 echo "== fault containment (a broken guest must not take down the translator) =="
-for mode in null w f; do
+for mode in null w f r; do
     out=$("$BIN" tests/fault.x86 "$mode" 2>&1 | grep -m1 '^fault:')
     if [ -n "$out" ]; then
         printf '  %-8s %s\n' "$mode" "$out"
@@ -93,6 +93,7 @@ compare() {
 compare native
 compare varargs
 compare callback
+compare jit
 
 echo
 echo "== Objective-C (message sends into native arm64 Foundation) =="
@@ -101,7 +102,7 @@ compare objcclass
 
 echo
 echo "== jit (every compiled block checked against the interpreter) =="
-for t in native varargs callback objc objcclass; do
+for t in native varargs callback jit objc objcclass; do
     [ -x "tests/$t.x86" ] || continue
     out=$("$BIN" -J -n 0 "tests/$t.x86" 2>&1 >/dev/null)
     blocks=$(printf '%s' "$out" | sed -n 's/.*jit: \([0-9]*\) blocks compiled.*/\1/p')

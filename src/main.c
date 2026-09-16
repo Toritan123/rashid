@@ -19,9 +19,49 @@
 #include "cpu.h"
 #include "jit.h"
 
+#include <dlfcn.h>
+#include <signal.h>
 #include <stdio.h>
+#include <sys/ucontext.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+
+// When a guest mistake - or a rashid one - takes the host process down,
+// report what was being executed rather than dying silently. Thunks call
+// native code with guest-supplied pointers, and compiled blocks run as native
+// code, so a host fault is a real possibility.
+static rsd_cpu *crash_cpu;
+static rsd_jit *crash_jit;
+
+static void on_crash(int sig, siginfo_t *si, void *ctx) {
+    ucontext_t *uc = ctx;
+    uint64_t pc = (uint64_t)uc->uc_mcontext->__ss.__pc;
+    char buf[320];
+    int n = snprintf(buf, sizeof buf,
+                     "\nrashid: host %s at %p (host pc 0x%llx)\n",
+                     sig == SIGSEGV ? "SIGSEGV" : "SIGBUS", si->si_addr, pc);
+    if (n > 0) write(2, buf, (size_t)n);
+    Dl_info info;
+    if (dladdr((void *)(uintptr_t)pc, &info) && info.dli_sname) {
+        n = snprintf(buf, sizeof buf, "        in %s+0x%llx\n", info.dli_sname,
+                     pc - (uint64_t)(uintptr_t)info.dli_saddr);
+        if (n > 0) write(2, buf, (size_t)n);
+    }
+    if (crash_jit && pc >= (uint64_t)(uintptr_t)crash_jit->arena &&
+        pc < (uint64_t)(uintptr_t)crash_jit->arena + crash_jit->used) {
+        n = snprintf(buf, sizeof buf, "        inside compiled code\n");
+        if (n > 0) write(2, buf, (size_t)n);
+    }
+    if (crash_cpu) {
+        n = snprintf(buf, sizeof buf,
+                     "        guest rip 0x%llx, last instruction 0x%llx\n",
+                     crash_cpu->rip, crash_cpu->cur_rip);
+        if (n > 0) write(2, buf, (size_t)n);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
 
 static void usage(void) {
     fprintf(stderr,
@@ -82,10 +122,19 @@ int main(int argc, char **argv) {
     rsd_cpu cpu;
     if (rsd_cpu_init(&cpu, &as, img.entry, img.has_main, argc - i, argv + i) < 0)
         return 1;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_crash;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    crash_cpu = &cpu;
+
     rsd_jit jitstate;
     if (jit) {
         if (rsd_jit_init(&jitstate) < 0) return 1;
         cpu.jit = &jitstate;
+        crash_jit = &jitstate;
         cpu.jit_check = jit_check;
     }
     cpu.stubs = &stubs;

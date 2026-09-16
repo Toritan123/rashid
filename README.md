@@ -459,47 +459,61 @@ the last region that answered made it very slightly *slower*. The region list
 is short and the scan is not where the time goes, so that idea is not the
 one.
 
-### A first block compiler
+### The block compiler
 
 `rashid -j` compiles basic blocks instead of interpreting them; `-J` does the
-same and checks every block against the interpreter before believing it.
+same and replays every block through the interpreter before believing it.
 
 ```
-work       interp       jit  speedup
-int        180.8m     74.1m    2.44x
-mem        319.1m    209.5m    1.52x
-flt        371.7m    410.4m    0.91x
-thunk      109.3m    107.5m    1.02x
+work      native   interp      jit  jit/interp  jit vs native
+int        14.4m   195.1m    54.1m       3.61x            18x
+mem        13.8m   368.6m    82.4m       4.48x            37x
+flt        22.0m   383.3m   463.5m       0.83x            45x
+thunk      18.7m   125.3m   108.5m       1.15x            15x
 ```
 
-Guest state stays in the `rsd_cpu` struct and compiled code calls back into
-the interpreter's own routines for flags and memory, so the two engines
-cannot disagree about what an instruction *means* — only about speed. What
-`-J` catches is a decoding or code-generation mistake, which is where a
-compiler actually goes wrong. Every AArch64 encoding is checked against
-clang's assembler by `make emit-test` rather than trusted.
+It compiles 32- and 64-bit integer operations with register, immediate and
+memory operands (base, scaled index, displacement, RIP-relative), `lea`,
+`inc`/`dec`, `push`/`pop`, and ends blocks at `jcc`, `jmp`, `call`, `ret` and
+their indirect forms. Guest state stays in the `rsd_cpu` struct and compiled
+code calls back into the interpreter's own routines for flags and memory, so
+the two engines cannot disagree about what an instruction *means*.
 
-The compiler understands only register-to-register integer operations.
-Anything else ends the block, which is why `flt` loses 9%: nothing in that
-loop compiles, and the cache is still consulted. That is the honest shape of
-a first version — the useful part is the infrastructure and the check, not
-the number.
+`flt` got worse, and it is worth saying why: the integer parts of that loop
+now compile, but every SSE instruction ends a block, so each iteration pays
+for the trip in and out more often than it saves. SSE in the compiler is what
+fixes it. `-j` is not the default.
 
-Two measurements steered it. The first attempt handled only 64-bit operands
-and managed 1.22x, because blocks were two instructions long: C `int` is 32
-bits, so `mov ebx, imm32` and `cmp edi, 3` are everywhere and each ended a
-block. Adding 32-bit forms took it to 2.4x, and cost almost nothing — an
-AArch64 W-register result is zero-extended into the X register, which is
-exactly what a 32-bit x86 operation does to the upper half.
+#### Checking the checker
 
-The second was a mistake. Consulting the cache only at branch targets removed
-the 9% loss on `flt`, but cost `mem` a quarter of its gain, because blocks
-that begin mid-sequence stopped being found. Reverted.
+A verifier that never fails proves nothing, so `make jit-mutations` breaks
+the compiler on purpose — an index scale off by one, RIP-relative addresses
+measured from the wrong place, an inverted branch, a 32-bit add done at 64
+bits, a push that forgets to move `rsp`, a `cmp` that writes its result — and
+requires `-J` to catch every one.
 
-What would move it further, in order: memory operands, which are the largest
-coverage gap; `jcc` as a block terminator, so a loop stays in compiled code;
-guest registers held in host registers, which removes a load and a store per
-operand; and lazy flags, which removes the helper call from most arithmetic.
+Getting there turned up four things:
+
+- **Memory had to be part of the comparison.** Replaying a block that did
+  `add [mem], 1` on memory the compiled block had already modified checks
+  nothing. Writes are now logged, undone before the replay, and compared. The
+  scale mutation is invisible without this: every register matched, and only
+  the address written to differed.
+- **The suite was not exercising the compiler.** With branches inverted,
+  `tests/arith` still passed — none of its compiled blocks ended in a taken
+  `jcc`. `tests/jit.c` exists for this, and was accepted only once it caught
+  every mutation.
+- **A result was stale.** HFS+ records modification times to the second, so
+  an edit followed by `make` within that second leaves an old binary that
+  `make` believes is current. A mutation reported as caught had in fact run
+  an unmutated binary. The script now deletes the binary before every build.
+- **The interpreter had a bug the compiler exposed.** The RIP-relative
+  mutation did not produce a disagreement — it crashed rashid. A GOT entry
+  read four bytes early gave a non-canonical pointer, and the bound check in
+  `access_ok` computed `ceiling - address` before comparing the two, which
+  wraps. Any wild pointer above the user range crashed the host instead of
+  faulting. Fixed, with a fault test for it, and rashid now reports host
+  crashes with the guest instruction that caused them.
 
 ## Roadmap
 
@@ -512,7 +526,7 @@ operand; and lazy flags, which removes the helper call from most arithmetic.
 | M2 | SSE — done; x87 remains | partial |
 | M3 | chained fixups, binding, C thunks — done | done |
 | **M4** | **Objective-C: selectors registered, message sends into native Foundation** | **done** |
-| M5 | basic-block JIT — first version, register-only integer ops | partial |
+| M5 | basic-block JIT — integer ops with memory operands and control flow | partial |
 | M6 | AOT cache, trace JIT | |
 
 **M4 was the goal line, and a Foundation application now runs.** What remains

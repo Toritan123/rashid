@@ -107,6 +107,34 @@ static inline uint32_t a64_sub_imm(int d, int n, uint32_t imm) {
     return 0xD1000000u | (imm << 10) | ((uint32_t)n << 5) | (uint32_t)d;
 }
 
+// add Xd, Xn, Xm, lsl #shift   - an index register times its scale
+static inline uint32_t a64_add_shift(int d, int n, int m, int shift) {
+    return 0x8B000000u | ((uint32_t)m << 16) | ((uint32_t)shift << 10) |
+           ((uint32_t)n << 5) | (uint32_t)d;
+}
+
+// ldrb Wt, [Xn, #off]
+static inline uint32_t a64_ldrb(int t, int n, uint32_t off) {
+    return 0x39400000u | (off << 10) | ((uint32_t)n << 5) | (uint32_t)t;
+}
+
+// cbz Wt, <pc + 4*imm19>   - imm19 is patched once the target is known
+static inline uint32_t a64_cbz_w(int t, int32_t imm19) {
+    return 0x34000000u | (((uint32_t)imm19 & 0x7FFFF) << 5) | (uint32_t)t;
+}
+
+// cmp Xn, #0
+static inline uint32_t a64_cmp0(int n) {
+    return 0xF100001Fu | ((uint32_t)n << 5);
+}
+
+// csel Xd, Xn, Xm, <cond>
+enum { A64_EQ = 0, A64_NE = 1 };
+static inline uint32_t a64_csel(int d, int n, int m, int cond) {
+    return 0x9A800000u | ((uint32_t)m << 16) | ((uint32_t)cond << 12) |
+           ((uint32_t)n << 5) | (uint32_t)d;
+}
+
 static inline uint32_t a64_blr(int n) { return 0xD63F0000u | ((uint32_t)n << 5); }
 static inline uint32_t a64_ret(void)  { return 0xD65F03C0u; }
 

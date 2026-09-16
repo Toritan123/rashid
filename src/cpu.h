@@ -31,6 +31,17 @@ enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI,
 // One XMM register. The x86_64 ABI passes floating-point arguments in
 // xmm0-7 and returns in xmm0, so these are needed for the calling convention
 // alone, before any vector code enters the picture.
+// Guest memory writes, recorded while a compiled block is being checked. The
+// block's writes are undone before the interpreter replays it, and the two
+// sequences are then compared, because re-running a read-modify-write on
+// memory that has already been modified would check nothing.
+#define RSD_WLOG_MAX 512
+struct rsd_writelog {
+    int n;
+    bool overflow;
+    struct { uint64_t addr, old, val; int size; } e[RSD_WLOG_MAX];
+};
+
 typedef union {
     uint8_t  b[16];
     uint16_t w[8];
@@ -57,6 +68,8 @@ typedef struct {
 
     struct rsd_jit *jit;  // compiled blocks, NULL when interpreting only
     bool     jit_check;   // run both engines and compare
+    uint64_t jit_tmp[4];  // scratch that compiled code keeps across calls
+    struct rsd_writelog *wlog; // records guest memory writes while checking
 
     rsd_as  *as;          // guest address space
     const rsd_stubs *stubs;   // imports with no thunk yet

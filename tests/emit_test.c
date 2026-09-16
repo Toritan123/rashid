@@ -56,6 +56,12 @@ int main(void) {
     check("orr w1, w2, w3",          a64_orr_w(1, 2, 3));
     check("eor w1, w2, w3",          a64_eor_w(1, 2, 3));
     check("mov w2, w7",              a64_mov_w(2, 7));
+    check("add x5, x5, x6, lsl #3",  a64_add_shift(5, 5, 6, 3));
+    check("ldrb w9, [x19, #200]",    a64_ldrb(9, 19, 200));
+    check("cbz w9, .+8",             a64_cbz_w(9, 2));
+    check("cbz w9, .-8",             a64_cbz_w(9, -2));
+    check("cmp x0, #0",              a64_cmp0(0));
+    check("csel x0, x2, x3, ne",     a64_csel(0, 2, 3, A64_NE));
     check("blr x9",                  a64_blr(9));
     check("ret",                     a64_ret());
     printf("%s\n", fails ? "ENCODING ERRORS" : "all encodings match the assembler");

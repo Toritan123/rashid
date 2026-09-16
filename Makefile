@@ -20,7 +20,7 @@ tests/%.x86: tests/%.c
 	clang -arch x86_64 -nostdlib -lSystem -Wl,-e,_start -O1 -o $@ $<
 
 GUESTS = hello arith tls ripimm sse vm fault
-EXTRA  = tests/import.x86 tests/native.x86 tests/varargs.x86 tests/objc.x86 tests/callback.x86 tests/objcclass.x86
+EXTRA  = tests/import.x86 tests/native.x86 tests/varargs.x86 tests/objc.x86 tests/callback.x86 tests/objcclass.x86 tests/jit.x86
 
 test: $(BIN) $(GUESTS:%=tests/%.x86) $(EXTRA)
 	@./tests/run.sh
@@ -59,3 +59,11 @@ bench: $(BIN) tests/bench.x86 $(EXTRA)
 .PHONY: emit-test
 emit-test: tests/emit_test.c src/emit.h
 	@$(CC) -O1 -arch arm64 -o /tmp/rsd_emit_test tests/emit_test.c && /tmp/rsd_emit_test
+
+tests/jit.x86: tests/jit.c
+	clang -arch x86_64 -O1 -o $@ $<
+
+# Break the compiler on purpose and require -J to notice.
+.PHONY: jit-mutations
+jit-mutations: tests/jit.x86
+	@./tests/jit_mutations.sh

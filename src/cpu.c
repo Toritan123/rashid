@@ -468,6 +468,43 @@ void rsd_i_flags_dec(rsd_cpu *c, uint64_t a, uint64_t r, uint64_t size) {
     flags_sub(c, a, 1, r, (int)size);
     c->flags = (c->flags & ~F_CF) | cf;
 }
+// Shifts. The count is masked by the caller, which also skips the call when
+// it comes out zero: a shift by zero changes nothing, not even a flag.
+//
+// CF is the last bit shifted out, which is the part a naive translation
+// drops. OF is architecturally defined only for a count of one; it is
+// computed the same way for any count here, as the hardware does, and the
+// test masks it off where the manual calls it undefined. AF is undefined
+// and left alone.
+uint64_t rsd_i_shift(rsd_cpu *c, uint64_t a, uint64_t cnt, uint64_t size, uint64_t ext) {
+    int sz = (int)size, w = sz * 8;
+    uint64_t ta = trunc_sz(a, sz), r, cf, of;
+    if (ext == 4 || ext == 6) {                              // shl / sal
+        r  = ta << cnt;
+        cf = cnt <= (uint64_t)w ? (ta >> (w - cnt)) & 1 : 0;
+        of = ((trunc_sz(r, sz) >> (w - 1)) & 1) ^ cf;
+    } else if (ext == 5) {                                   // shr
+        r  = ta >> cnt;
+        cf = cnt <= (uint64_t)w ? (ta >> (cnt - 1)) & 1 : 0;
+        of = (ta >> (w - 1)) & 1;
+    } else {                                                 // sar
+        // A byte or word count is masked to 31, so it can exceed the
+        // operand: an arithmetic shift then stops at all-sign-bits.
+        int64_t sa = sext(a, sz);
+        int sh = cnt >= (uint64_t)w ? w - 1 : (int)cnt;
+        int cb = cnt - 1 >= (uint64_t)w ? w - 1 : (int)(cnt - 1);
+        r  = (uint64_t)(sa >> sh);
+        cf = (uint64_t)(sa >> cb) & 1;
+        of = 0;
+    }
+    uint64_t res = trunc_sz(r, sz);
+    c->flags &= ~(F_CF | F_OF);
+    if (cf) c->flags |= F_CF;
+    if (of) c->flags |= F_OF;
+    set_pzs(c, res, sz);
+    return res;
+}
+
 uint64_t rsd_i_cond(rsd_cpu *c, uint64_t cc) {
     return cond(c, (int)cc) ? 1 : 0;
 }
@@ -1431,6 +1468,14 @@ static void step(rsd_cpu *c) {
 
     case 0x90: ADVANCE(); return; // nop
 
+    // pushfq / popfq. c->flags already uses the architectural bit positions,
+    // so only the reserved bits and the flags rashid does not model have to
+    // be forced: bit 1 reads as one, and interrupts are always enabled.
+    case 0x9C: ADVANCE(); push(c, c->flags); return;
+    case 0x9D: ADVANCE();
+               c->flags = (uint32_t)(pop(c) & (F_CF | F_PF | F_AF | F_ZF | F_SF | F_OF)) | 0x202;
+               return;
+
     case 0x98: // cwde / cdqe
         ADVANCE();
         setreg(c, RAX, (uint64_t)sext(getreg(c, RAX, sz / 2), sz / 2), sz);
@@ -1467,16 +1512,10 @@ static void step(rsd_cpu *c) {
         ADVANCE();
         cnt &= (sz == 8) ? 63 : 31;
         if (!cnt) return;
-        uint64_t a = rd(c, &rm, sz, d.has_rex), r;
-        switch (ext) {
-        case 4: case 6: r = a << cnt; break;                 // shl/sal
-        case 5: r = trunc_sz(a, sz) >> cnt; break;           // shr
-        case 7: r = (uint64_t)(sext(a, sz) >> cnt); break;   // sar
-        default: c->fault = "rotate not implemented"; c->fault_rip = start;
-                 c->running = false; return;
-        }
-        flags_logic(c, r, sz);
-        wr(c, &rm, r, sz, d.has_rex);
+        if (ext < 4) { c->fault = "rotate not implemented"; c->fault_rip = start;
+                       c->running = false; return; }
+        uint64_t a = rd(c, &rm, sz, d.has_rex);
+        wr(c, &rm, rsd_i_shift(c, a, cnt, (uint64_t)sz, (uint64_t)ext), sz, d.has_rex);
         return;
     }
 
@@ -1807,6 +1846,7 @@ static bool run_block(rsd_cpu *c, void *body, uint32_t ninsn) {
     return true;
 }
 
+
 void rsd_cpu_run(rsd_cpu *c, uint64_t budget) {
     g_cpu = c;
     while (c->running) {
@@ -1827,6 +1867,10 @@ void rsd_cpu_run(rsd_cpu *c, uint64_t budget) {
         if (c->trace)
             fprintf(stderr, "  %6llu  rip=0x%llx rax=0x%llx rdi=0x%llx rsp=0x%llx\n",
                     c->icount, c->rip, c->r[RAX], c->r[RDI], c->r[RSP]);
+        // What the interpreter is still being asked to run is what the
+        // compiler should learn next, so count it while the jit is on.
+        if (c->jit && rsd_as_ok(c->as, c->rip, 4, RSD_PROT_X))
+            rsd_jit_note_interp(c->jit, rsd_g2h(c->as, c->rip));
         step(c);
         if (++c->icount == budget && budget) {
             c->fault = "instruction budget exhausted";

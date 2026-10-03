@@ -37,17 +37,19 @@ def main():
     if not live:
         print("this machine cannot execute x86_64; nothing to compare against")
 
-    # Both columns include process startup, which is most of a short run.
-    # The crossover table below shows that baseline; subtract it for the
-    # interpreter's own cost, which is closer to 50-100x.
+    # Both columns include process startup. The crossover table below shows
+    # that baseline; the compute column subtracts it from both. The counts
+    # are large enough that the native run is several times startup, because
+    # Rosetta is fast enough that a smaller one is almost all startup and the
+    # subtraction then divides by noise.
     base_n = best([B, "int", "0"]) if live else 0
     base_x = best([BIN, "-n", "0", B, "int", "0"])
     print(f"startup: native {base_n*1000:.1f}ms, rashid {base_x*1000:.1f}ms "
           f"(included in both columns below)\n")
     print(f"{'work':<8}{'guest instr':>14}{'native':>10}{'rashid':>10}"
           f"{'ratio':>8}{'compute':>9}{'M instr/s':>11}")
-    for w, n in (("int", 2_000_000), ("mem", 2_000_000),
-                 ("flt", 2_000_000), ("thunk", 500_000)):
+    for w, n in (("int", 6_000_000), ("mem", 6_000_000), ("flt", 6_000_000),
+                 ("hash", 6_000_000), ("thunk", 2_000_000)):
         x = best([BIN, "-n", "0", B, w, str(n)])
         ic = guest_instructions([B, w, str(n)])
         r = best([B, w, str(n)]) if live else 0

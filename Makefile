@@ -20,7 +20,7 @@ tests/%.x86: tests/%.c
 	clang -arch x86_64 -nostdlib -lSystem -Wl,-e,_start -O1 -o $@ $<
 
 GUESTS = hello arith tls ripimm sse vm fault
-EXTRA  = tests/import.x86 tests/native.x86 tests/varargs.x86 tests/objc.x86 tests/callback.x86 tests/objcclass.x86 tests/jit.x86 tests/jitsse.x86
+EXTRA  = tests/import.x86 tests/native.x86 tests/varargs.x86 tests/objc.x86 tests/callback.x86 tests/objcclass.x86 tests/jit.x86 tests/jitsse.x86 tests/jitint.x86
 
 test: $(BIN) $(GUESTS:%=tests/%.x86) $(EXTRA)
 	@./tests/run.sh
@@ -69,4 +69,7 @@ jit-mutations: tests/jit.x86
 	@./tests/jit_mutations.sh
 
 tests/jitsse.x86: tests/jitsse.c
+	clang -arch x86_64 -O1 -o $@ $<
+
+tests/jitint.x86: tests/jitint.c
 	clang -arch x86_64 -O1 -o $@ $<

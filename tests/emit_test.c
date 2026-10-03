@@ -62,6 +62,16 @@ int main(void) {
     check("cbz w9, .-8",             a64_cbz_w(9, -2));
     check("cmp x0, #0",              a64_cmp0(0));
     check("csel x0, x2, x3, ne",     a64_csel(0, 2, 3, A64_NE));
+    check("mul x3, x1, x2",          a64_mul(3, 1, 2));
+    check("mul w3, w1, w2",          a64_mul_w(3, 1, 2));
+    check("strb w9, [x19, #200]",    a64_strb(9, 19, 200));
+    check("ubfx x3, x2, #8, #8",     a64_ubfx(3, 2, 8, 8));
+    check("ubfx x3, x2, #0, #16",    a64_ubfx(3, 2, 0, 16));
+    check("bfi x3, x2, #8, #8",      a64_bfi(3, 2, 8, 8));
+    check("sxtb x3, w2",             a64_sxt(3, 2, 8));
+    check("sxth x3, w2",             a64_sxt(3, 2, 16));
+    check("sxtb w3, w2",             a64_sxt_w(3, 2, 8));
+    check("sxth w3, w2",             a64_sxt_w(3, 2, 16));
     check("bic x3, x2, x1",          a64_bic(3, 2, 1));
     check("csetm x3, mi",            a64_csetm(3, A64_MI));
     check("csetm x3, eq",            a64_csetm(3, A64_EQ));

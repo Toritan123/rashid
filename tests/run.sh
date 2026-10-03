@@ -15,17 +15,27 @@ BIN=${BIN:-./rashid}
 fail=0
 native_seen=0
 
+# Whether this machine can execute x86_64 at all, decided once against a
+# guest whose exit status is known. Asking each test in turn would read a
+# status of 126 or 127 as "no Rosetta" when it was really the answer.
+x86_live=no
+if [ -x tests/hello.x86 ]; then
+    tests/hello.x86 >/dev/null 2>&1
+    case $? in 126|127) ;; *) x86_live=yes ;; esac
+fi
+
 run_case() {
     name=$1; want=$2
     "$BIN" "tests/$name.x86" >/dev/null 2>&1
     got=$?
 
-    "tests/$name.x86" >/dev/null 2>&1
-    nat=$?
-    case $nat in
-        126|127) nat="n/a" ;;      # cannot execute: no Rosetta on this machine
-        *) native_seen=1 ;;
-    esac
+    if [ $x86_live = yes ]; then
+        "tests/$name.x86" >/dev/null 2>&1
+        nat=$?
+        native_seen=1
+    else
+        nat="n/a"
+    fi
 
     status="ok"
     [ "$got" = "$want" ] || { status="FAIL (expected $want)"; fail=1; }
@@ -60,16 +70,8 @@ compare() {
     name=$1
     r_out=$("$BIN" "tests/$name.x86" 2>/dev/null); r=$?
 
-    # Prefer the hardware when it is still here. 126 and 127 mean the binary
-    # could not be executed at all, which is what the absence of Rosetta
-    # looks like.
-    "tests/$name.x86" >/dev/null 2>&1
-    case $? in
-        126|127) live=no ;;
-        *)       live=yes ;;
-    esac
-
-    if [ "$live" = yes ]; then
+    # Prefer the hardware while it is still here.
+    if [ $x86_live = yes ]; then
         n_out=$("tests/$name.x86" 2>/dev/null); n=$?
         native_seen=1
         src="native"
@@ -95,6 +97,7 @@ compare varargs
 compare callback
 compare jit
 compare jitsse
+compare jitint
 
 echo
 echo "== Objective-C (message sends into native arm64 Foundation) =="
@@ -103,7 +106,7 @@ compare objcclass
 
 echo
 echo "== jit (every compiled block checked against the interpreter) =="
-for t in native varargs callback jit jitsse objc objcclass; do
+for t in native varargs callback jit jitsse jitint objc objcclass; do
     [ -x "tests/$t.x86" ] || continue
     out=$("$BIN" -J -n 0 "tests/$t.x86" 2>&1 >/dev/null)
     blocks=$(printf '%s' "$out" | sed -n 's/.*jit: \([0-9]*\) blocks compiled.*/\1/p')

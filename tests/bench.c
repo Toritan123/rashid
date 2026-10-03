@@ -18,9 +18,10 @@
 //   int    pure interpretation - decode, dispatch, flags
 //   mem    loads and stores, so the permission checks on every access
 //   flt    scalar double, where one guest instruction does more work
+//   hash   shifts, multiplies and byte loads - hashing, decoding, strings
 //   thunk  crossing into native libSystem, where rashid barely interprets
 //
-// Usage: bench <int|mem|flt|thunk> <iterations>
+// Usage: bench <int|mem|flt|hash|thunk> <iterations>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,6 +47,20 @@ static double float_work(long n) {
     return s;
 }
 
+// The shape of most real integer code, and the shape the first block
+// compiler could not touch: a shift, a multiply and a byte in memory.
+static long hash_work(long n) {
+    static unsigned char buf[256];
+    for (int i = 0; i < 256; i++) buf[i] = (unsigned char)(i * 131 + 7);
+    unsigned long h = 0xcbf29ce484222325UL;
+    for (long i = 0; i < n; i++) {
+        h = (h ^ buf[i & 255]) * 0x100000001b3UL;
+        h ^= h >> 29;
+        buf[(i * 7) & 255] = (unsigned char)(h >> 11);
+    }
+    return (long)(h & 0x7fffffff);
+}
+
 static long thunk_work(long n) {
     static char buf[64];
     long s = 0;
@@ -60,7 +75,8 @@ int main(int argc, char **argv) {
     if (!strcmp(w, "int"))        printf("%ld\n", integer_work(n));
     else if (!strcmp(w, "mem"))   printf("%ld\n", memory_work(n));
     else if (!strcmp(w, "flt"))   printf("%.3f\n", float_work(n));
+    else if (!strcmp(w, "hash"))  printf("%ld\n", hash_work(n));
     else if (!strcmp(w, "thunk")) printf("%ld\n", thunk_work(n));
-    else { fprintf(stderr, "usage: bench <int|mem|flt|thunk> <iterations>\n"); return 2; }
+    else { fprintf(stderr, "usage: bench <int|mem|flt|hash|thunk> <iterations>\n"); return 2; }
     return 0;
 }

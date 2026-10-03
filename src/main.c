@@ -143,9 +143,7 @@ int main(int argc, char **argv) {
 
     if (cpu.fault) { rsd_cpu_dump(&cpu); rsd_cpu_free(&cpu); return 1; }
 
-    if (jit)
-        fprintf(stderr, "-- jit: %llu blocks compiled, %llu entered, %llu declined --\n",
-                jitstate.compiled, jitstate.executed, jitstate.bailed);
+    if (jit) rsd_jit_report(&jitstate, cpu.icount);
     fprintf(stderr, "-- guest exited with status %d after %llu instructions --\n",
            cpu.exit_code, cpu.icount);
     rsd_cpu_free(&cpu);

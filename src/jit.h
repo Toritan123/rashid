@@ -19,10 +19,12 @@
 // The interpreter costs about forty-five cycles per guest instruction, most
 // of it decoding the same bytes over and over. A block compiler decodes once.
 //
-// This first version keeps all guest state in the rsd_cpu struct and calls
-// back into the interpreter's own routines for flags and memory, so the two
+// All guest state stays in the rsd_cpu struct and the compiler calls back
+// into the interpreter's own routines for flags and memory, so the two
 // engines cannot disagree about semantics - only about speed. Holding guest
-// registers in host registers is the obvious next step and a separate one.
+// registers in host registers, which would remove a load and a store per
+// operand, is the obvious next step and a separate one; lazy flags, which
+// would remove the helper call from most arithmetic, is the one after.
 //
 // Anything not understood simply ends the block, and the interpreter takes
 // over from there, so the compiler can stay small and grow by measurement.
@@ -47,7 +49,11 @@ typedef struct rsd_jit {
         uint32_t pad;
     } *cache;
     int      cache_bits;
-    uint64_t compiled, executed, bailed;
+    uint64_t compiled, executed, bailed, interp;
+    // What the interpreter was asked to run, by opcode. The next thing
+    // worth compiling is whatever is at the top of this list.
+    struct rsd_jit_prof { uint8_t b[4]; uint64_t n; } *prof;
+    int      nprof;
 } rsd_jit;
 
 int  rsd_jit_init(rsd_jit *j);
@@ -57,6 +63,11 @@ void rsd_jit_free(rsd_jit *j);
 // if there is nothing here the compiler understands.
 void *rsd_jit_lookup(rsd_jit *j, rsd_cpu *c, uint64_t rip);
 uint32_t rsd_jit_count(const rsd_jit *j, uint64_t rip);
+
+// One guest instruction the compiler declined, counted and - with
+// RASHID_JIT_PROFILE set - recorded by its first four bytes.
+void rsd_jit_note_interp(rsd_jit *j, const uint8_t *code);
+void rsd_jit_report(const rsd_jit *j, uint64_t icount);
 
 // Implemented in jitenter.S.
 uint64_t rsd_jit_enter(rsd_cpu *c, void *body);

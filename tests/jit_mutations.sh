@@ -11,7 +11,7 @@ set -u
 cd "$(dirname "$0")/.."
 SRC=src/jit.c
 # A mutation counts as caught if -J objects on any of these.
-GUESTS=("tests/jit.x86" "tests/jitsse.x86" "tests/bench.x86 flt 2000")
+GUESTS=("tests/jit.x86" "tests/jitsse.x86" "tests/jitint.x86" "tests/bench.x86 flt 2000")
 for g in "${GUESTS[@]}"; do
     f=${g%% *}
     [ -x "$f" ] || { echo "build $f first"; exit 1; }
@@ -87,6 +87,28 @@ mutate "andnot operands swapped" \
   's{a64_bic\(A64_X1, A64_X4, A64_X1\)}{a64_bic(A64_X1, A64_X1, A64_X4)}'
 mutate "sqrt of destination, not source" \
   's{dbl \? a64_fsqrt_d\(D0, D1\) : a64_fsqrt_s\(D0, D1\)}{dbl ? a64_fsqrt_d(D0, D2) : a64_fsqrt_s(D0, D2)}'
+
+# narrow operands, shifts, multiplies, setcc
+mutate "byte write clears the register" \
+  's{put\(b, a64_strb\(src, CPU, off_r\(reg\)\)\);}{put(b, a64_str(src, CPU, off_r(reg)));}'
+mutate "ah read as al" \
+  's{put\(b, a64_ubfx\(dst, dst, 8, 8\)\);}{}'
+mutate "ah written as al" \
+  's{put\(b, a64_bfi\(A64_X9, src, 8, 8\)\);}{put(b, a64_bfi(A64_X9, src, 0, 8));}'
+mutate "movsx widened as movzx" \
+  's{if \(!o->sign\)}{if (1)}'
+mutate "movzx from a byte takes a word" \
+  's{o->ssize = \(op2 & 1\) \? 2 : 1;}{o->ssize = 2;}'
+mutate "shift count not masked" \
+  's{int mask = \(o->size == 8\) \? 63 : 31;}{int mask = 63;}'
+mutate "shift by zero shifts anyway" \
+  's{if \(!o->by_cl && !\(o->imm & \(uint64_t\)mask\)\) return;}{}'
+mutate "shift by cl takes rdx" \
+  's{put\(b, a64_ldr\(A64_X5, CPU, off_r\(1\)\)\);}{put(b, a64_ldr(A64_X5, CPU, off_r(2)));}'
+mutate "32-bit multiply done at 64 bits" \
+  's{o->size == 8 \? a64_mul\(A64_X3, A64_X1, A64_X2\)\n                            : a64_mul_w\(A64_X3, A64_X1, A64_X2\)}{a64_mul(A64_X3, A64_X1, A64_X2)}s'
+mutate "setcc inverted" \
+  's{o->cc = op2 & 0xF;}{o->cc = (op2 & 0xF) ^ 1;}'
 
 cp "$orig" "$SRC"
 rebuild

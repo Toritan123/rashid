@@ -25,6 +25,7 @@
 #include <sys/mman.h>
 
 #define ARENA (4u << 20)
+#define PROF_MAX 1024          // distinct opcodes the profile remembers
 #define CACHE_BITS 12          // small enough to stay in cache
 #define MAX_BLOCK 2048         // emitted words before a block is closed
 
@@ -45,6 +46,7 @@ uint64_t rsd_i_nan_d(uint64_t, uint64_t, uint64_t, uint64_t);
 uint64_t rsd_i_nan_s(uint64_t, uint64_t, uint64_t, uint64_t);
 void     rsd_i_flags_inc(rsd_cpu *, uint64_t, uint64_t, uint64_t);
 void     rsd_i_flags_dec(rsd_cpu *, uint64_t, uint64_t, uint64_t);
+uint64_t rsd_i_shift(rsd_cpu *, uint64_t, uint64_t, uint64_t, uint64_t);
 
 #define CPU A64_X19            // compiled code's only base register
 #define MAX_INSNS 48           // guest instructions per block
@@ -104,15 +106,16 @@ static void put_leave(buf *b) {
 }
 
 // --- the compilable subset -------------------------------------------
-// Integer operations on 32- and 64-bit operands, with register, immediate
-// and memory operands; lea, push, pop; and the control transfers that end a
-// block. Byte and 16-bit forms, SSE, segment overrides and anything else end
-// the block and the interpreter carries on.
+// Integer operations on 8-, 32- and 64-bit operands, with register,
+// immediate and memory operands; movzx and movsx; lea, push, pop; and the
+// control transfers that end a block. 16-bit forms, segment overrides and
+// anything else end the block and the interpreter carries on.
 
 // Pseudo-opcodes for operations that have no ALU row of their own.
 enum { OP_INC = 0x100, OP_DEC = 0x101 };
 
 enum { K_RR = 1, K_RI, K_RM, K_MR, K_MI, K_LEA, K_PUSH, K_POP, K_NOP, K_SSE,
+       K_MOVX, K_SHIFT, K_IMUL, K_SETCC,
        K_JCC, K_JMP, K_CALL, K_RET, K_CALLM, K_JMPM };
 
 typedef struct {
@@ -123,6 +126,13 @@ typedef struct {
     int64_t  disp;
     uint64_t imm;
     bool     no_write;
+    // The 8-bit register file depends on whether a REX prefix was present,
+    // so the compiler has to remember that it saw one even when it is empty.
+    bool     has_rex;
+    int      ssize;             // movzx/movsx: width of the source
+    bool     sign;
+    int      ext;               // shifts: the modrm extension that names one
+    bool     by_cl, imm_src;
     int      cc;
     uint64_t next, target;
     // SSE: mandatory prefix, second opcode byte, xmm destination, xmm or
@@ -202,20 +212,24 @@ static int decode(const uint8_t *p, uint64_t rip, insn *o) {
     // A 66/F2/F3 prefix selects an SSE instruction; on anything else it is an
     // operand-size or rep prefix, which the compiler does not handle.
     if (p[n] == 0x66 || p[n] == 0xF2 || p[n] == 0xF3) mand = p[n++];
-    if ((p[n] & 0xF0) == 0x40) rex = p[n++];
+    if ((p[n] & 0xF0) == 0x40) { rex = p[n++]; o->has_rex = true; }
     o->size = (rex & 8) ? 8 : 4;
     uint8_t op = p[n++], m;
     int32_t d32;
     if (mand && op != 0x0F) return 0;
 
     switch (op) {
-    case 0x01: case 0x03: case 0x09: case 0x0B:
-    case 0x21: case 0x23: case 0x29: case 0x2B:
-    case 0x31: case 0x33: case 0x39: case 0x3B:
-    case 0x85: case 0x89: case 0x8B: {
+    case 0x00: case 0x01: case 0x02: case 0x03:
+    case 0x08: case 0x09: case 0x0A: case 0x0B:
+    case 0x20: case 0x21: case 0x22: case 0x23:
+    case 0x28: case 0x29: case 0x2A: case 0x2B:
+    case 0x30: case 0x31: case 0x32: case 0x33:
+    case 0x38: case 0x39: case 0x3A: case 0x3B:
+    case 0x84: case 0x85: case 0x88: case 0x89: case 0x8A: case 0x8B: {
+        if (!(op & 1) || op == 0x88 || op == 0x8A) o->size = 1;
         m = p[n++];
         int regf = ((m >> 3) & 7) | ((rex & 4) ? 8 : 0);
-        bool to_reg = (op & 2) && op != 0x85;
+        bool to_reg = (op & 2) && op != 0x84 && op != 0x85;
         if ((m >> 6) == 3) {
             int rm = (m & 7) | ((rex & 1) ? 8 : 0);
             o->kind = K_RR;
@@ -226,34 +240,52 @@ static int decode(const uint8_t *p, uint64_t rip, insn *o) {
             o->kind = to_reg ? K_RM : K_MR;
             o->reg = regf;
         }
-        o->op = (op == 0x85) ? 0x85 : (op == 0x89 || op == 0x8B) ? 0x88 : (op & ~3);
+        o->op = (op == 0x84 || op == 0x85) ? 0x85 : (op & ~3);
         o->no_write = (o->op == 0x38 || o->op == 0x85);
         break;
     }
-    case 0x81: case 0x83: case 0xC7: {
+    case 0x80: case 0x81: case 0x83: case 0xC6: case 0xC7: {
+        bool byte = (op == 0x80 || op == 0xC6);
+        bool mov = (op == 0xC6 || op == 0xC7);
+        if (byte) o->size = 1;
         m = p[n++];
         int ext = (m >> 3) & 7;
-        if (op == 0xC7 && ext != 0) return 0;
-        if (op != 0xC7 && (ext == 2 || ext == 3)) return 0;   // adc/sbb
+        if (mov && ext != 0) return 0;
+        if (!mov && (ext == 2 || ext == 3)) return 0;         // adc/sbb
         if ((m >> 6) == 3) { o->kind = K_RI; o->reg = (m & 7) | ((rex & 1) ? 8 : 0); }
         else               { modrm_mem(p, &n, rex, m, o); o->kind = K_MI; }
-        if (op == 0x83) o->imm = (uint64_t)(int64_t)(int8_t)p[n++];
+        if (byte)           o->imm = p[n++];
+        else if (op == 0x83) o->imm = (uint64_t)(int64_t)(int8_t)p[n++];
         else { memcpy(&d32, p + n, 4); n += 4; o->imm = (uint64_t)(int64_t)d32; }
         if (o->size == 4) o->imm &= 0xffffffffu;
-        if (op == 0xC7) { o->op = 0x88; break; }
+        if (mov) { o->op = 0x88; break; }
         static const int map[8] = { 0x00, 0x08, 0, 0, 0x20, 0x28, 0x30, 0x38 };
         o->op = map[ext];
         o->no_write = (ext == 7);
         break;
     }
-    case 0xA9:                                  // test eax/rax, imm32
+    case 0x04: case 0x0C: case 0x24: case 0x2C: case 0x34: case 0x3C:
+    case 0xA8:                                  // op al, imm8
+        o->size = 1;
+        /* fall through */
+    case 0x05: case 0x0D: case 0x25: case 0x2D: case 0x35: case 0x3D:
+    case 0xA9: {                                // op eax/rax, imm
         o->kind = K_RI;
         o->reg = 0;
-        memcpy(&d32, p + n, 4); n += 4;
-        o->imm = (uint64_t)(int64_t)d32;
+        if (o->size == 1) o->imm = p[n++];
+        else { memcpy(&d32, p + n, 4); n += 4; o->imm = (uint64_t)(int64_t)d32; }
         if (o->size == 4) o->imm &= 0xffffffffu;
-        o->op = 0x85;
-        o->no_write = true;
+        o->op = (op == 0xA8 || op == 0xA9) ? 0x85 : (op & ~7);
+        o->no_write = (o->op == 0x38 || o->op == 0x85);
+        break;
+    }
+    case 0xB0: case 0xB1: case 0xB2: case 0xB3:
+    case 0xB4: case 0xB5: case 0xB6: case 0xB7:
+        o->kind = K_RI;
+        o->size = 1;
+        o->reg = (op & 7) | ((rex & 1) ? 8 : 0);
+        o->imm = p[n++];
+        o->op = 0x88;
         break;
     case 0xB8: case 0xB9: case 0xBA: case 0xBB:
     case 0xBC: case 0xBD: case 0xBE: case 0xBF:
@@ -263,6 +295,30 @@ static int decode(const uint8_t *p, uint64_t rip, insn *o) {
         else { uint32_t v; memcpy(&v, p + n, 4); o->imm = v; n += 4; }
         o->op = 0x88;
         break;
+    case 0xC0: case 0xC1: case 0xD0: case 0xD1: case 0xD2: case 0xD3:
+        if (op == 0xC0 || op == 0xD0 || op == 0xD2) o->size = 1;
+        m = p[n++];
+        o->ext = (m >> 3) & 7;
+        if (o->ext < 4) return 0;                       // rotates
+        if ((m >> 6) == 3) o->reg = (m & 7) | ((rex & 1) ? 8 : 0);
+        else               modrm_mem(p, &n, rex, m, o);
+        o->kind = K_SHIFT;
+        if (op == 0xC0 || op == 0xC1) o->imm = p[n++];
+        else if (op == 0xD2 || op == 0xD3) o->by_cl = true;
+        else o->imm = 1;
+        break;
+
+    case 0x69: case 0x6B:                               // imul r, r/m, imm
+        m = p[n++];
+        o->kind = K_IMUL;
+        o->imm_src = true;
+        o->reg = ((m >> 3) & 7) | ((rex & 4) ? 8 : 0);
+        if ((m >> 6) == 3) o->src = (m & 7) | ((rex & 1) ? 8 : 0);
+        else               modrm_mem(p, &n, rex, m, o);
+        if (op == 0x6B) o->imm = (uint64_t)(int64_t)(int8_t)p[n++];
+        else { memcpy(&d32, p + n, 4); n += 4; o->imm = (uint64_t)(int64_t)d32; }
+        break;
+
     case 0x8D:
         m = p[n++];
         if ((m >> 6) == 3) return 0;
@@ -294,6 +350,30 @@ static int decode(const uint8_t *p, uint64_t rip, insn *o) {
             if (mand) return 0;
             o->kind = K_JCC; o->cc = op2 & 0xF;
             memcpy(&d32, p + n, 4); n += 4; o->imm = (uint64_t)(int64_t)d32;
+        } else if (op2 == 0xAF) {                   // imul r, r/m
+            if (mand) return 0;
+            o->kind = K_IMUL;
+            m = p[n++];
+            o->reg = ((m >> 3) & 7) | ((rex & 4) ? 8 : 0);
+            if ((m >> 6) == 3) o->src = (m & 7) | ((rex & 1) ? 8 : 0);
+            else               modrm_mem(p, &n, rex, m, o);
+        } else if (op2 >= 0x90 && op2 <= 0x9F) {    // setcc r/m8
+            if (mand) return 0;
+            o->kind = K_SETCC;
+            o->size = 1;
+            o->cc = op2 & 0xF;
+            m = p[n++];
+            if ((m >> 6) == 3) o->reg = (m & 7) | ((rex & 1) ? 8 : 0);
+            else               modrm_mem(p, &n, rex, m, o);
+        } else if (op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF) {
+            if (mand) return 0;                     // a 16-bit destination
+            o->kind = K_MOVX;
+            o->ssize = (op2 & 1) ? 2 : 1;
+            o->sign = (op2 & 8) != 0;
+            m = p[n++];
+            o->reg = ((m >> 3) & 7) | ((rex & 4) ? 8 : 0);
+            if ((m >> 6) == 3) o->src = (m & 7) | ((rex & 1) ? 8 : 0);
+            else               modrm_mem(p, &n, rex, m, o);
         } else if (op2 == 0x1F) {                   // multi-byte nop
             if (mand && mand != 0x66) return 0;
             m = p[n++];
@@ -309,7 +389,8 @@ static int decode(const uint8_t *p, uint64_t rip, insn *o) {
     case 0xE9: o->kind = K_JMP;  memcpy(&d32, p + n, 4); n += 4; o->imm = (uint64_t)(int64_t)d32; break;
     case 0xE8: o->kind = K_CALL; memcpy(&d32, p + n, 4); n += 4; o->imm = (uint64_t)(int64_t)d32; break;
     case 0xC3: o->kind = K_RET; break;
-    case 0xFF: {
+    case 0xFE: case 0xFF: {
+        if (op == 0xFE) o->size = 1;
         m = p[n++];
         int ext = (m >> 3) & 7;
         if (ext == 0 || ext == 1) {                 // inc / dec
@@ -319,7 +400,7 @@ static int decode(const uint8_t *p, uint64_t rip, insn *o) {
             o->op = ext == 0 ? OP_INC : OP_DEC;
             break;
         }
-        if (ext != 2 && ext != 4) return 0;
+        if (op == 0xFE || (ext != 2 && ext != 4)) return 0;
         if ((m >> 6) == 3) {
             o->reg = (m & 7) | ((rex & 1) ? 8 : 0);
             if (o->reg == 4) return 0;
@@ -338,6 +419,39 @@ static int decode(const uint8_t *p, uint64_t rip, insn *o) {
     if (o->kind == K_JCC || o->kind == K_JMP || o->kind == K_CALL)
         o->target = o->next + o->imm;
     return n;
+}
+
+// --- the guest register file -----------------------------------------
+// Reading a register wider than the operand is harmless: add, sub and the
+// bitwise operations never carry information downwards, and the flag
+// helpers truncate what they are given. Only ah..bh need extracting, and
+// only a narrow write needs care, because x86 leaves the rest in place.
+
+static bool is_high_byte(const insn *o, int reg, int size) {
+    return size == 1 && !o->has_rex && reg >= 4 && reg < 8;
+}
+
+static void put_rd_reg(buf *b, int dst, const insn *o, int reg, int size) {
+    if (is_high_byte(o, reg, size)) {
+        put(b, a64_ldr(dst, CPU, off_r(reg - 4)));
+        put(b, a64_ubfx(dst, dst, 8, 8));
+        return;
+    }
+    put(b, a64_ldr(dst, CPU, off_r(reg)));
+}
+
+static void put_wr_reg(buf *b, int src, const insn *o, int reg, int size) {
+    if (size == 1) {
+        if (is_high_byte(o, reg, size)) {
+            put(b, a64_ldr(A64_X9, CPU, off_r(reg - 4)));
+            put(b, a64_bfi(A64_X9, src, 8, 8));
+            put(b, a64_str(A64_X9, CPU, off_r(reg - 4)));
+        } else {
+            put(b, a64_strb(src, CPU, off_r(reg)));
+        }
+        return;
+    }
+    put(b, a64_str(src, CPU, off_r(reg)));      // 32-bit results arrive zero-extended
 }
 
 // Effective address into x1. A RIP-relative one is a constant here, because
@@ -359,7 +473,7 @@ static void put_ea(buf *b, const insn *o) {
 // With the operands in x1 and x2, the result into x3. Returns the flag helper
 // the operation needs, if any.
 static void *put_op(buf *b, const insn *o) {
-    bool w = o->size == 4;
+    bool w = o->size != 8;
     switch (o->op) {
     case 0x88: put(b, w ? a64_mov_w(A64_X3, A64_X2) : a64_mov(A64_X3, A64_X2)); return NULL;
     case 0x00: put(b, w ? a64_add_w(A64_X3, A64_X1, A64_X2) : a64_add(A64_X3, A64_X1, A64_X2));
@@ -662,11 +776,11 @@ static void put_insn(buf *b, const insn *o, uint64_t rip) {
 
     case K_RR:
     case K_RI:
-        put(b, a64_ldr(A64_X1, CPU, off_r(o->reg)));
+        put_rd_reg(b, A64_X1, o, o->reg, o->size);
         if (o->kind == K_RI) put_imm(b, A64_X2, o->imm);
-        else                 put(b, a64_ldr(A64_X2, CPU, off_r(o->src)));
+        else                 put_rd_reg(b, A64_X2, o, o->src, o->size);
         fl = put_op(b, o);
-        if (!o->no_write) put(b, a64_str(A64_X3, CPU, off_r(o->reg)));
+        if (!o->no_write) put_wr_reg(b, A64_X3, o, o->reg, o->size);
         put_flags(b, fl, o->size);
         return;
 
@@ -675,11 +789,97 @@ static void put_insn(buf *b, const insn *o, uint64_t rip) {
         put_ea(b, o);
         put_load(b, o->size);
         put(b, a64_mov(A64_X2, A64_X0));
-        put(b, a64_ldr(A64_X1, CPU, off_r(o->reg)));
+        put_rd_reg(b, A64_X1, o, o->reg, o->size);
         fl = put_op(b, o);
-        if (!o->no_write) put(b, a64_str(A64_X3, CPU, off_r(o->reg)));
+        if (!o->no_write) put_wr_reg(b, A64_X3, o, o->reg, o->size);
         put_flags(b, fl, o->size);
         return;
+
+    case K_SHIFT: {
+        int mask = (o->size == 8) ? 63 : 31;
+        if (!o->by_cl && !(o->imm & (uint64_t)mask)) return;   // nothing happens
+        // The count is settled first, because a count of zero must leave
+        // even the operand unread: the interpreter returns before it looks.
+        int skip = -1;
+        if (o->by_cl) {
+            put(b, a64_ldr(A64_X5, CPU, off_r(1)));            // rcx
+            put(b, a64_ubfx(A64_X5, A64_X5, 0, mask == 63 ? 6 : 5));
+            skip = b->n;
+            put(b, a64_cbz_w(A64_X5, 0));
+        }
+        if (o->mem) {
+            put_set_rip(b, rip);
+            put_ea(b, o);
+            put(b, a64_str(A64_X1, CPU, off_tmp(0)));
+            put_load(b, o->size);
+            put(b, a64_mov(A64_X1, A64_X0));
+        } else {
+            put_rd_reg(b, A64_X1, o, o->reg, o->size);
+        }
+        if (o->by_cl) put(b, a64_mov(A64_X2, A64_X5));
+        else          put_imm(b, A64_X2, o->imm & (uint64_t)mask);
+        put(b, a64_mov(A64_X0, CPU));
+        put_imm(b, A64_X3, (uint64_t)o->size);
+        put_imm(b, A64_X4, (uint64_t)o->ext);
+        put_call(b, rsd_i_shift);
+        if (o->mem) {
+            put(b, a64_mov(A64_X2, A64_X0));
+            put(b, a64_ldr(A64_X1, CPU, off_tmp(0)));
+            put_store(b, o->size);
+        } else {
+            put_wr_reg(b, A64_X0, o, o->reg, o->size);
+        }
+        if (skip >= 0 && !b->full) b->out[skip] = a64_cbz_w(A64_X5, b->n - skip);
+        return;
+    }
+
+    case K_IMUL:
+        if (o->mem) {
+            put_set_rip(b, rip);
+            put_ea(b, o);
+            put_load(b, o->size);
+            put(b, a64_mov(A64_X1, A64_X0));
+        } else {
+            put(b, a64_ldr(A64_X1, CPU, off_r(o->src)));
+        }
+        if (o->imm_src) put_imm(b, A64_X2, o->imm);
+        else            put(b, a64_ldr(A64_X2, CPU, off_r(o->reg)));
+        put(b, o->size == 8 ? a64_mul(A64_X3, A64_X1, A64_X2)
+                            : a64_mul_w(A64_X3, A64_X1, A64_X2));
+        put(b, a64_str(A64_X3, CPU, off_r(o->reg)));
+        put_flags(b, rsd_i_flags_logic, o->size);
+        return;
+
+    case K_SETCC:
+        put(b, a64_mov(A64_X0, CPU));
+        put_imm(b, A64_X1, (uint64_t)o->cc);
+        put_call(b, rsd_i_cond);
+        if (o->mem) {
+            put(b, a64_str(A64_X0, CPU, off_tmp(0)));
+            put_set_rip(b, rip);
+            put_ea(b, o);
+            put(b, a64_ldr(A64_X2, CPU, off_tmp(0)));
+            put_store(b, 1);
+        } else {
+            put_wr_reg(b, A64_X0, o, o->reg, 1);
+        }
+        return;
+
+    case K_MOVX: {                              // movzx / movsx
+        int bits = o->ssize * 8;
+        if (o->mem) {
+            put_set_rip(b, rip);
+            put_ea(b, o);
+            put_load(b, o->ssize);
+        } else {
+            put_rd_reg(b, A64_X0, o, o->src, o->ssize);
+        }
+        if (!o->sign)          put(b, a64_ubfx(A64_X0, A64_X0, 0, bits));
+        else if (o->size == 8) put(b, a64_sxt(A64_X0, A64_X0, bits));
+        else                   put(b, a64_sxt_w(A64_X0, A64_X0, bits));
+        put(b, a64_str(A64_X0, CPU, off_r(o->reg)));
+        return;
+    }
 
     case K_MR:                                  // [mem] = [mem] op reg
     case K_MI:
@@ -687,7 +887,7 @@ static void put_insn(buf *b, const insn *o, uint64_t rip) {
         put_ea(b, o);
         if (o->op == 0x88) {                    // a plain store
             if (o->kind == K_MI) put_imm(b, A64_X2, o->imm);
-            else                 put(b, a64_ldr(A64_X2, CPU, off_r(o->reg)));
+            else                 put_rd_reg(b, A64_X2, o, o->reg, o->size);
             put_store(b, o->size);
             return;
         }
@@ -695,7 +895,7 @@ static void put_insn(buf *b, const insn *o, uint64_t rip) {
         put_load(b, o->size);
         put(b, a64_mov(A64_X1, A64_X0));
         if (o->kind == K_MI) put_imm(b, A64_X2, o->imm);
-        else                 put(b, a64_ldr(A64_X2, CPU, off_r(o->reg)));
+        else                 put_rd_reg(b, A64_X2, o, o->reg, o->size);
         fl = put_op(b, o);
         if (!o->no_write) {
             put(b, a64_str(A64_X1, CPU, off_tmp(1)));
@@ -818,13 +1018,46 @@ int rsd_jit_init(rsd_jit *j) {
     j->cache_bits = CACHE_BITS;
     j->cache = calloc((size_t)1 << CACHE_BITS, sizeof *j->cache);
     if (!j->cache) return -1;
+    if (getenv("RASHID_JIT_PROFILE")) j->prof = calloc(PROF_MAX, sizeof *j->prof);
     return 0;
 }
 
 void rsd_jit_free(rsd_jit *j) {
     if (j->arena && j->arena != MAP_FAILED) munmap(j->arena, j->size);
     free(j->cache);
+    free(j->prof);
     memset(j, 0, sizeof *j);
+}
+
+void rsd_jit_note_interp(rsd_jit *j, const uint8_t *code) {
+    j->interp++;
+    if (!j->prof) return;
+    for (int i = 0; i < j->nprof; i++)
+        if (!memcmp(j->prof[i].b, code, 4)) { j->prof[i].n++; return; }
+    if (j->nprof < PROF_MAX) {
+        memcpy(j->prof[j->nprof].b, code, 4);
+        j->prof[j->nprof++].n = 1;
+    }
+}
+
+void rsd_jit_report(const rsd_jit *j, uint64_t icount) {
+    double pct = icount ? 100.0 * (double)(icount - j->interp) / (double)icount : 0;
+    fprintf(stderr, "-- jit: %llu blocks compiled, %llu entered, %llu declined, "
+            "%.1f%% of instructions compiled --\n",
+            j->compiled, j->executed, j->bailed, pct);
+    if (!j->prof) return;
+    // A copy, so reporting does not reorder what is still being collected.
+    struct rsd_jit_prof *p = malloc((size_t)j->nprof * sizeof *p);
+    if (!p) return;
+    memcpy(p, j->prof, (size_t)j->nprof * sizeof *p);
+    for (int i = 0; i < j->nprof; i++)
+        for (int k = i + 1; k < j->nprof; k++)
+            if (p[k].n > p[i].n) { struct rsd_jit_prof t = p[i]; p[i] = p[k]; p[k] = t; }
+    fprintf(stderr, "-- what the interpreter still ran --\n");
+    for (int i = 0; i < j->nprof && i < 20; i++)
+        fprintf(stderr, "   %12llu  %02x %02x %02x %02x\n", p[i].n,
+                p[i].b[0], p[i].b[1], p[i].b[2], p[i].b[3]);
+    free(p);
 }
 
 static size_t slot_of(const rsd_jit *j, uint64_t rip) {

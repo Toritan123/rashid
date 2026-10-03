@@ -98,7 +98,8 @@ make test
 - A shared address space with per-region permission tracking, so a wild guest
   pointer is reported precisely instead of crashing the translator.
 - An integer instruction subset: ALU with carry (`adc`/`sbb`), flags, `jcc`,
-  `call`/`ret`, `mul`/`div`, `movzx`/`movsx`, `cmovcc`, `setcc`, `shld`/`shrd`
+  `call`/`ret`, `mul`/`div`, `movzx`/`movsx`, `cmovcc`, `setcc`, `shld`/`shrd`,
+  `pushfq`/`popfq`
 - **Thread-local storage.** macOS x86_64 keeps a thread's TSD block at `%gs`
   and installs it with the machine-dependent syscall `0x3000003`;
   `pthread_getspecific` is then one instruction, `movq %gs:(,%rdi,8), %rax`.
@@ -410,31 +411,38 @@ plausible nearby address instead of faulting.
 `make bench`. Measured on an M1 against the same binary run through Rosetta.
 
 ```
-startup: native 11.8ms, rashid 6.4ms
+startup: native 11.8ms, rashid 6.1ms
 
 work       guest instr    native    rashid   ratio  compute  M instr/s
-int         14,000,052     13.3m    176.4m     13x     108x       82.3
-mem         20,000,060     13.1m    322.0m     25x     243x       63.4
-flt         26,000,070     21.2m    361.0m     17x      38x       73.3
-thunk        7,000,074     22.7m    109.3m      5x       9x       68.0
+int         42,000,052     17.3m    543.2m     31x      98x       78.2
+mem         60,000,059     17.4m    972.6m     56x     171x       62.1
+flt         78,000,070     39.4m   1093.4m     28x      39x       71.7
+hash        90,001,360     24.6m   1396.6m     57x     109x       64.7
+thunk       28,000,082     33.3m    452.4m     14x      21x       62.8
 ```
 
 The interpreter runs at 60–80 million guest instructions per second, which
-puts it 40–240x behind Rosetta on code the guest actually executes. That is
+puts it 20–170x behind Rosetta on code the guest actually executes. That is
 an ordinary number for a switch-dispatch interpreter, and closing it is what
-the JIT is for; the spread is informative too. Floating point costs only 38x
-because one guest instruction does more work, and thunk-heavy code only 9x
+the JIT is for; the spread is informative too. Floating point costs only 39x
+because one guest instruction does more work, and thunk-heavy code only 21x
 because rashid barely interprets — the work happens in native arm64
 libSystem either way.
+
+The iteration counts are large because Rosetta is fast: at a tenth of them
+the native column was almost entirely process startup, and subtracting the
+baseline from it left a compute ratio that moved between 100x and 500x from
+run to run. That column is a difference of two measurements, so it needs the
+measurements to be much larger than the thing subtracted.
 
 Whole applications tell a different story, because most of what an
 application does is not its own code:
 
 ```
 app            guest instr    native    rashid   ratio
-native                  70     13.4m      7.1m    0.5x
-objc                   187     17.7m     11.8m    0.7x
-objcclass              282     15.9m     10.7m    0.7x
+native                  70     10.7m      6.1m    0.6x
+objc                   187     14.8m     10.8m    0.7x
+objcclass              282     14.5m      9.4m    0.6x
 ```
 
 Rashid starts in half the time, because it has nothing to translate: the
@@ -443,17 +451,18 @@ hundred thousand guest instructions:
 
 ```
   iterations   guest instr    native    rashid   ratio
-           0            49     13.7m      7.1m    0.5x
-      10,000        70,052     13.9m      7.9m    0.6x
-     100,000       700,052     13.4m     16.9m    1.3x
-   1,000,000     7,000,052     14.6m     92.7m    6.4x
+           0            49     11.3m      6.5m    0.6x
+      10,000        70,052     13.1m      7.8m    0.6x
+     100,000       700,052     11.6m     16.1m    1.4x
+   1,000,000     7,000,052     12.3m     97.1m    7.9x
 ```
 
 Below that, rashid wins on startup alone. Above it, interpretation dominates
 and Rosetta pulls away. Short-lived tools are already competitive; anything
-that computes is not, and will not be until the JIT lands.
+that computes depends on the block compiler below, which these figures do
+not use.
 
-One negative result worth recording: `mem` is the worst case at 243x, which
+One negative result worth recording: `mem` is the worst case at 171x, which
 looked like the per-access permission check scanning the region list. Caching
 the last region that answered made it very slightly *slower*. The region list
 is short and the scan is not where the time goes, so that idea is not the
@@ -466,18 +475,70 @@ same and replays every block through the interpreter before believing it.
 
 ```
 work      native   interp      jit  jit/interp  jit vs native
-int        14.0m   181.1m    45.0m       4.02x            17x
-mem        13.1m   322.1m    78.2m       4.12x              -
-flt        21.3m   359.7m    40.1m       8.97x             3x
-thunk      16.9m   110.4m    82.0m       1.35x            15x
+int        13.3m   183.9m    45.0m       4.09x            3.4x
+mem        12.2m   325.0m    78.1m       4.16x            6.4x
+flt        20.7m   366.8m    40.0m       9.17x            1.9x
+hash       15.5m   465.7m    95.8m       4.86x            6.2x
+thunk      15.6m   111.2m    61.4m       1.81x            3.9x
 ```
 
-It compiles 32- and 64-bit integer operations with register, immediate and
-memory operands (base, scaled index, displacement, RIP-relative), `lea`,
-`inc`/`dec`, `push`/`pop`, and ends blocks at `jcc`, `jmp`, `call`, `ret` and
-their indirect forms. Guest state stays in the `rsd_cpu` struct and compiled
-code calls back into the interpreter's own routines for flags and memory, so
-the two engines cannot disagree about what an instruction *means*.
+It compiles 8-, 32- and 64-bit integer operations with register, immediate
+and memory operands (base, scaled index, displacement, RIP-relative), `lea`,
+`inc`/`dec`, `push`/`pop`, shifts, `imul`, `movzx`/`movsx`, `setcc`, and ends
+blocks at `jcc`, `jmp`, `call`, `ret` and their indirect forms. Guest state
+stays in the `rsd_cpu` struct and compiled code calls back into the
+interpreter's own routines for flags and memory, so the two engines cannot
+disagree about what an instruction *means*.
+
+`hash` is new, and is why: a shift, a multiply and a byte in memory, which is
+the shape of most real integer code and of which the first compiler could
+compile nothing. It ran at interpreter speed, 387ms, and now runs in 96ms.
+`thunk`, which is byte work around a `strlen` call, went from 1.35x to 1.81x
+over the interpreter.
+
+`RASHID_JIT_PROFILE=1` reports how much of the run was compiled and lists, by
+opcode, what the interpreter was still asked to do; that list is how the
+order above was chosen. `int`, `mem`, `flt` and `hash` now compile 100% of
+the instructions they execute, `thunk` 86% — the rest being the import stub,
+which is the interpreter's job by design.
+
+#### What eight-bit operands cost
+
+Two x86 rules have nowhere to show themselves in C, so neither the compiler
+nor the tests stumbled on them by accident:
+
+- **A byte write merges.** Writing `al` leaves the other seven bytes of `rax`
+  alone, where writing `eax` clears the upper four. Compiled code stores a
+  byte with `strb`, not `str`.
+- **`ah`, `ch`, `dh`, `bh` are not registers 4 to 7.** Without a REX prefix
+  those numbers name bits 8..15 of `rax`, `rcx`, `rdx` and `rbx`; with any
+  REX prefix — even an empty `0x40` — they name the low byte of `rsp`, `rbp`,
+  `rsi` and `rdi`. The compiler has to remember that it saw a prefix with no
+  bits set.
+
+Reading a byte needs no masking at all, which is worth stating because it
+looks like it should: addition, subtraction and the bitwise operations never
+carry information downwards, and the flag helpers truncate what they are
+given, so the low eight bits of a full-width operation are already the
+answer. Only `ah`-style reads need extracting.
+
+#### A shift was losing its carry
+
+Adding shifts to the compiler meant giving the two engines one definition of
+a shift, and writing it down found that the *interpreter* had been setting a
+shift's flags with the same routine as `and` — clearing CF and OF every time.
+On x86, CF is the last bit shifted out. Anything that shifts and then tests
+the carry, which is how bignum arithmetic, `__builtin_*` carry chains and
+plenty of hash functions are written, was reading a zero. Both engines now
+compute CF properly, and OF as the hardware does. (The test masks off the
+bits the manual leaves undefined — AF always, OF unless the count was one —
+rather than pinning down behaviour that is not promised.)
+
+A shift by zero changes nothing at all, not even a flag, and that case is
+easy to get wrong in a way nothing notices: the one mutation that was missed
+on the first run put the shift back in for a count of zero, and the test did
+not see it because the flags were overwritten two instructions later. The
+test now reads them.
 
 Scalar SSE compiles too: moves, arithmetic, `min`/`max`, `sqrt`, all eight
 comparison predicates, `comis`, bitwise operations and the conversions.
@@ -513,16 +574,29 @@ cannot, here. A quotient of two floats cannot land within 2⁻⁵³ of a
 single-precision rounding boundary without landing exactly on it, and 200
 million random pairs agreed.
 
+#### What would move it further
+
+In order of what the profile says is left: guest registers held in host
+registers, which removes a load and a store per operand and is the largest
+remaining win; lazy flags, which removes the helper call from most
+arithmetic; 16-bit operands and the `0x66` prefix, which is a small
+remaining hole; and the SSE long tail. Each is a separate change, because
+each needs its own mutations.
+
 #### Checking the checker
 
 A verifier that never fails proves nothing, so `make jit-mutations` breaks
-the compiler twelve ways on purpose — an index scale off by one, RIP-relative
-addresses measured from the wrong place, an inverted branch, a 32-bit add
-done at 64 bits, a push that forgets to move `rsp`, a `cmp` that writes its
-result, `min` returning the wrong operand on NaN, the `le` predicate compiled
-as `lt`, a generated NaN left with arm64's sign, a 32-bit integer converted
-as 64-bit, `andnot` with its operands swapped, `sqrt` of the wrong register —
-and requires `-J` to catch every one.
+the compiler twenty-two ways on purpose — an index scale off by one,
+RIP-relative addresses measured from the wrong place, an inverted branch, a
+32-bit add done at 64 bits, a push that forgets to move `rsp`, a `cmp` that
+writes its result, `min` returning the wrong operand on NaN, the `le`
+predicate compiled as `lt`, a generated NaN left with arm64's sign, a 32-bit
+integer converted as 64-bit, `andnot` with its operands swapped, `sqrt` of
+the wrong register, a byte write that clears its register, `ah` read and
+written as `al`, `movsx` widened as `movzx`, a shift count left unmasked, a
+shift by zero done anyway, a shift taking its count from the wrong register,
+a 32-bit multiply done at 64 bits, `setcc` inverted — and requires `-J` to
+catch every one.
 
 Getting there turned up these, each a way a passing test was not evidence:
 
@@ -573,7 +647,7 @@ Getting there turned up these, each a way a passing test was not evidence:
 | M2 | SSE — done; x87 remains | partial |
 | M3 | chained fixups, binding, C thunks — done | done |
 | **M4** | **Objective-C: selectors registered, message sends into native Foundation** | **done** |
-| M5 | basic-block JIT — integer ops with memory operands and control flow | partial |
+| M5 | basic-block JIT — integer, SSE, narrow operands, shifts, control flow | partial |
 | M6 | AOT cache, trace JIT | |
 
 **M4 was the goal line, and a Foundation application now runs.** What remains

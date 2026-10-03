@@ -113,9 +113,42 @@ static inline uint32_t a64_add_shift(int d, int n, int m, int shift) {
            ((uint32_t)n << 5) | (uint32_t)d;
 }
 
+// mul Xd, Xn, Xm  (madd with the zero register)
+static inline uint32_t a64_mul(int d, int n, int m) {
+    return 0x9B007C00u | ((uint32_t)m << 16) | ((uint32_t)n << 5) | (uint32_t)d;
+}
+static inline uint32_t a64_mul_w(int d, int n, int m) {
+    return 0x1B007C00u | ((uint32_t)m << 16) | ((uint32_t)n << 5) | (uint32_t)d;
+}
+
 // ldrb Wt, [Xn, #off]
 static inline uint32_t a64_ldrb(int t, int n, uint32_t off) {
     return 0x39400000u | (off << 10) | ((uint32_t)n << 5) | (uint32_t)t;
+}
+
+// strb Wt, [Xn, #off]
+static inline uint32_t a64_strb(int t, int n, uint32_t off) {
+    return 0x39000000u | (off << 10) | ((uint32_t)n << 5) | (uint32_t)t;
+}
+
+// Bitfield moves, for the 8-bit register file: ah..bh live at bits 8..15 of
+// another register, and a byte write leaves the rest of its register alone.
+// ubfx Xd, Xn, #lsb, #width   and   bfi Xd, Xn, #lsb, #width
+static inline uint32_t a64_ubfx(int d, int n, int lsb, int width) {
+    return 0xD3400000u | ((uint32_t)lsb << 16) | ((uint32_t)(lsb + width - 1) << 10) |
+           ((uint32_t)n << 5) | (uint32_t)d;
+}
+static inline uint32_t a64_bfi(int d, int n, int lsb, int width) {
+    return 0xB3400000u | ((uint32_t)((64 - lsb) & 63) << 16) |
+           ((uint32_t)(width - 1) << 10) | ((uint32_t)n << 5) | (uint32_t)d;
+}
+
+// Sign extension, in both destination widths, for movsx.
+static inline uint32_t a64_sxt(int d, int n, int bits) {      // Xd <- sign(Wn)
+    return 0x93400000u | ((uint32_t)(bits - 1) << 10) | ((uint32_t)n << 5) | (uint32_t)d;
+}
+static inline uint32_t a64_sxt_w(int d, int n, int bits) {    // Wd <- sign(Wn)
+    return 0x13000000u | ((uint32_t)(bits - 1) << 10) | ((uint32_t)n << 5) | (uint32_t)d;
 }
 
 // cbz Wt, <pc + 4*imm19>   - imm19 is patched once the target is known

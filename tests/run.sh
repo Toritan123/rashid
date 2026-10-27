@@ -63,6 +63,18 @@ for mode in null w f r; do
         printf '  %-8s FAIL: no fault reported\n' "$mode"; fail=1
     fi
 done
+# Compiled code's in-line accesses, at the edges they must refuse.
+for mode in e s p; do
+    out=$("$BIN" -j tests/jitmem.x86 "$mode" 2>&1 | grep -m1 '^fault:')
+    case $out in
+        *"guest memory protection"*) printf '  jit %-4s %s\n' "$mode" "$out" ;;
+        *) printf '  jit %-4s FAIL: expected a protection fault, got: %s\n' "$mode" "${out:-none}"; fail=1 ;;
+    esac
+done
+"$BIN" -j tests/jitmem.x86 >/dev/null 2>&1
+r=$?
+if [ $r = 4 ]; then printf '  jit %-4s accesses just inside every edge succeed\n' "-"
+else printf '  jit %-4s FAIL: accesses inside the edges gave exit %s, not 4\n' "-" "$r"; fail=1; fi
 
 echo
 echo "== native thunks (real binaries running through arm64 libSystem) =="

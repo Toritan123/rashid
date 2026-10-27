@@ -47,6 +47,7 @@ uint64_t rsd_i_nan_s(uint64_t, uint64_t, uint64_t, uint64_t);
 void     rsd_i_flags_inc(rsd_cpu *, uint64_t, uint64_t, uint64_t);
 void     rsd_i_flags_dec(rsd_cpu *, uint64_t, uint64_t, uint64_t);
 uint64_t rsd_i_shift(rsd_cpu *, uint64_t, uint64_t, uint64_t, uint64_t);
+void     rsd_i_wlog(rsd_cpu *, uint64_t, uint64_t, uint64_t);
 
 #define CPU A64_X19            // compiled code's only base register
 #define MAX_INSNS 48           // guest instructions per block
@@ -55,6 +56,7 @@ typedef struct {
     uint32_t *out;
     int       n, max;
     bool      full;
+    bool      check;           // -J: in-line stores must be logged too
     int       fix[256];        // cbz words to point at the fault exit
     int       nfix;
 } buf;
@@ -83,6 +85,7 @@ static uint32_t off_xmm(int i) { return (uint32_t)(offsetof(rsd_cpu, xmm) + (siz
 #define OFF_CURRIP  ((uint32_t)offsetof(rsd_cpu, cur_rip))
 #define OFF_RUNNING ((uint32_t)offsetof(rsd_cpu, running))
 #define OFF_FLAGS   ((uint32_t)offsetof(rsd_cpu, flags))
+#define OFF_AS      ((uint32_t)offsetof(rsd_cpu, as))
 
 // Which instruction is executing, so a fault inside a helper is reported
 // against it rather than against wherever the block began.
@@ -654,18 +657,85 @@ static void put_flags(buf *b, const insn *o, void *fn, int size) {
     put_call(b, fn);
 }
 
+static void put_patch_bcond(buf *b, int at, int cond) {
+    if (!b->full) b->out[at] = a64_bcond(cond, b->n - at);
+}
+static void put_patch_b(buf *b, int at) {
+    if (!b->full) b->out[at] = a64_b(b->n - at);
+}
+
+// Loads and stores are made in line when the address falls in the region
+// the last compiled access of the same kind succeeded in, and otherwise go
+// through the interpreter's routine, which does the full check, reports a
+// fault, and notes the region for next time. The in-line check is a
+// subtraction and one unsigned compare: below the start wraps to a huge
+// offset, so it fails the same way as beyond the end.
+//
+// Returns where the branch to the slow path is, for put_patch.
+static int put_region_check(buf *b, bool write) {
+    uint32_t e = (uint32_t)(write ? offsetof(rsd_as, wr) : offsetof(rsd_as, rd));
+    put(b, a64_ldr(A64_X9, CPU, OFF_AS));
+    put(b, a64_ldr(A64_X10, A64_X9, e));
+    put(b, a64_ldr(A64_X11, A64_X9, e + 8));
+    put(b, a64_sub(A64_X12, A64_X1, A64_X10));
+    put(b, a64_subs_zr(A64_X12, A64_X11, false));
+    int hit = b->n;
+    put(b, a64_bcond(A64_CC, 0));
+    put(b, a64_ldr(A64_X10, A64_X9, e + 16));
+    put(b, a64_ldr(A64_X11, A64_X9, e + 24));
+    put(b, a64_sub(A64_X12, A64_X1, A64_X10));
+    put(b, a64_subs_zr(A64_X12, A64_X11, false));
+    int at = b->n;
+    put(b, a64_bcond(A64_CS, 0));
+    put_patch_bcond(b, hit, A64_CC);
+    return at;
+}
+
 static void put_load(buf *b, int size) {        // x1 = address -> x0 = value
+    int slow = put_region_check(b, false);
+    switch (size) {
+    case 1:  put(b, a64_ldrb(A64_X0, A64_X1, 0)); break;
+    case 2:  put(b, a64_ldrh(A64_X0, A64_X1, 0)); break;
+    case 4:  put(b, a64_ldr_w(A64_X0, A64_X1, 0)); break;
+    default: put(b, a64_ldr(A64_X0, A64_X1, 0)); break;
+    }
+    int done = b->n;
+    put(b, a64_b(0));
+    put_patch_bcond(b, slow, A64_CS);
     put(b, a64_mov(A64_X0, CPU));
     put_imm(b, A64_X2, (uint64_t)size);
     put_call(b, rsd_i_ld);
     put_fault_check(b);
+    put_patch_b(b, done);
 }
 
 static void put_store(buf *b, int size) {       // x1 = address, x2 = value
+    int slow = put_region_check(b, true);
+    if (b->check) {
+        // Stores made here do not pass through the interpreter's st(), so
+        // under -J they are logged first, or the comparison would miss them.
+        put(b, a64_str(A64_X1, CPU, off_tmp(6)));
+        put(b, a64_str(A64_X2, CPU, off_tmp(7)));
+        put(b, a64_mov(A64_X0, CPU));
+        put_imm(b, A64_X3, (uint64_t)size);
+        put_call(b, rsd_i_wlog);
+        put(b, a64_ldr(A64_X1, CPU, off_tmp(6)));
+        put(b, a64_ldr(A64_X2, CPU, off_tmp(7)));
+    }
+    switch (size) {
+    case 1:  put(b, a64_strb(A64_X2, A64_X1, 0)); break;
+    case 2:  put(b, a64_strh(A64_X2, A64_X1, 0)); break;
+    case 4:  put(b, a64_str_w(A64_X2, A64_X1, 0)); break;
+    default: put(b, a64_str(A64_X2, A64_X1, 0)); break;
+    }
+    int done = b->n;
+    put(b, a64_b(0));
+    put_patch_bcond(b, slow, A64_CS);
     put(b, a64_mov(A64_X0, CPU));
     put_imm(b, A64_X3, (uint64_t)size);
     put_call(b, rsd_i_st);
     put_fault_check(b);
+    put_patch_b(b, done);
 }
 
 // --- SSE code generation ---------------------------------------------
@@ -949,11 +1019,14 @@ static void put_insn(buf *b, const insn *o, uint64_t rip) {
             put(b, a64_cbz_w(A64_X5, 0));
         }
         if (o->mem) {
+            // The load may call out, and x5 does not survive a call.
+            if (o->by_cl) put(b, a64_str(A64_X5, CPU, off_tmp(1)));
             put_set_rip(b, rip);
             put_ea(b, o);
             put(b, a64_str(A64_X1, CPU, off_tmp(0)));
             put_load(b, o->size);
             put(b, a64_mov(A64_X1, A64_X0));
+            if (o->by_cl) put(b, a64_ldr(A64_X5, CPU, off_tmp(1)));
         } else {
             put_rd_reg(b, A64_X1, o, o->reg, o->size);
         }
@@ -1147,7 +1220,7 @@ int rsd_jit_init(rsd_jit *j) {
     j->size = ARENA;
     // Compiled code addresses rsd_cpu fields with scaled 12-bit offsets.
     if (off_r(15) >= 32768 || OFF_CURRIP % 8 || OFF_CURRIP >= 32768 ||
-        off_tmp(3) >= 4096 || OFF_RUNNING >= 4096 ||
+        off_tmp(7) >= 4096 || OFF_RUNNING >= 4096 || OFF_AS % 8 || OFF_AS >= 32768 ||
         OFF_FLAGS % 4 || OFF_FLAGS >= 16384 ||
         off_xmm(0) % 8 || off_xmm(15) + 8 >= 4096) {
         fprintf(stderr, "rashid: rsd_cpu layout is out of reach of the jit\n");
@@ -1243,7 +1316,7 @@ void *rsd_jit_lookup(rsd_jit *j, rsd_cpu *c, uint64_t rip) {
     buf b;
     for (;;) {
         flag_liveness(v, count);
-        b = (buf){ .out = words, .n = 0, .max = MAX_BLOCK - 24 };
+        b = (buf){ .out = words, .n = 0, .max = MAX_BLOCK - 24, .check = c->jit_check };
         put(&b, a64_push(A64_X30));
         int i = 0;
         uint64_t at = rip;

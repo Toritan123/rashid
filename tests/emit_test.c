@@ -65,6 +65,8 @@ int main(void) {
     check("mul x3, x1, x2",          a64_mul(3, 1, 2));
     check("mul w3, w1, w2",          a64_mul_w(3, 1, 2));
     check("strb w9, [x19, #200]",    a64_strb(9, 19, 200));
+    check("ldrh w0, [x1]",           a64_ldrh(0, 1, 0));
+    check("strh w2, [x1, #6]",       a64_strh(2, 1, 6));
     check("ubfx x3, x2, #8, #8",     a64_ubfx(3, 2, 8, 8));
     check("ubfx x3, x2, #0, #16",    a64_ubfx(3, 2, 0, 16));
     check("bfi x3, x2, #8, #8",      a64_bfi(3, 2, 8, 8));
@@ -120,6 +122,8 @@ int main(void) {
     check("fcvt s0, d1",             a64_fcvt_sd(0, 1));
     check("fcvt d0, s1",             a64_fcvt_ds(0, 1));
     check("b.vc .+36",               a64_bcond(A64_VC, 9));
+    check("b .+36",                  a64_b(9));
+    check("b.hs .+12",               a64_bcond(A64_CS, 3));
     check("blr x9",                  a64_blr(9));
     check("ret",                     a64_ret());
     printf("%s\n", fails ? "ENCODING ERRORS" : "all encodings match the assembler");

@@ -475,11 +475,11 @@ same and replays every block through the interpreter before believing it.
 
 ```
 work      native   interp      jit  jit/interp  jit vs native
-int        14.1m   184.8m    23.5m       7.87x            1.7x
-mem        12.8m   324.3m    41.9m       7.74x            3.3x
-flt        22.4m   368.3m    37.8m       9.74x            1.7x
-hash       14.8m   465.8m    55.4m       8.41x            3.7x
-thunk      16.0m   111.2m    52.3m       2.13x            3.3x
+int        13.2m   190.4m    23.1m       8.22x            1.8x
+mem        13.1m   334.2m    26.9m      12.41x            2.1x
+flt        21.2m   376.3m    39.2m       9.60x            1.9x
+hash       16.0m   476.6m    47.0m      10.15x            2.9x
+thunk      16.3m   114.1m    46.7m       2.45x            2.9x
 ```
 
 It compiles 8-, 32- and 64-bit integer operations with register, immediate
@@ -487,9 +487,9 @@ and memory operands (base, scaled index, displacement, RIP-relative), `lea`,
 `inc`/`dec`, `push`/`pop`, shifts, `imul`, `movzx`/`movsx`, `setcc`, and ends
 blocks at `jcc`, `jmp`, `call`, `ret` and their indirect forms. Guest state
 stays in the `rsd_cpu` struct and compiled code calls back into the
-interpreter's own routines for memory and for the less common flags, so the
-two engines share one definition of most of what an instruction *means*; the
-exception is described under flags below.
+interpreter's own routines for memory it has not seen yet and for the less
+common flags, so the two engines share one definition of most of what an
+instruction *means*; the exceptions are described below.
 
 `hash` was added for the change that taught the compiler shifts, multiplies
 and bytes: that is the shape of most real integer code, and the first
@@ -627,20 +627,81 @@ the mutation, not the test: a shift by `cl` has no immediate, so the edited
 condition still came out zero and nothing had changed. The script's check
 that a mutation *applied* only compares the text.
 
+#### Memory in line
+
+`mem` did not move with the flag changes, because what it had left was a
+call into the interpreter for every load and store, with the permission
+check that decides whether the guest may touch that address. That check is
+now made in line when it can be: the region the last compiled loads, and
+the last compiled stores, succeeded in is remembered, and an access inside
+one is a subtraction, one unsigned compare and the `ldr` or `str` itself.
+Anything else — a new region, a region boundary, an address that is not
+guest memory at all — still goes to the interpreter's routine, which makes
+the full check, faults if it must, and remembers the region for next time.
+Any `mmap`, `mprotect` or `munmap` forgets them all.
+
+```
+              flags     memory
+              in line   in line
+mem           104.6m     66.0m
+hash          153.6m    129.1m
+thunk         192.1m    169.2m
+```
+
+It remembers two regions of each kind, not one. With one, `thunk` became 8%
+*slower*: its loop writes a byte to its buffer and then calls `strlen`,
+which writes the return address to the stack, so the two stores alternated
+between two regions, every one missed, and a miss now looked the region up
+twice. `flt`, which makes no memory accesses in its loop, ran 2.6% slower
+throughout; aligning blocks did not change that, so it is not where the
+loop's code landed, and it is not yet explained. The next change below
+takes the path it must be on out of the loop.
+
+The edges are what the tests have to reach. `tests/jitmem.c` reads 8 bytes
+that overrun a remembered region by one byte, once while that region is the
+newer of the two and once while it is the older, and writes to a region
+after making it read-only; each must fault exactly as the interpreter
+would. The first version of that test checked nothing it claimed to: its
+helper functions `pop rbp` before returning, which reads the stack, so the
+stack had always become the newer region by the time the edge was read. The
+sequences are now single `asm` statements.
+
+Writing it also found a bug in the shift code that had been there since
+shifts were compiled. A shift of a memory operand by `cl` kept the count in
+`x5` across the call that loads the operand, and `x5` does not survive a
+call. It worked because the interpreter's load routine happened not to use
+`x5`.
+
+And it found a gap in `-J`. A store wider than it should be changes bytes
+that no log entry names; undoing the logged writes leaves them changed, the
+interpreter then sees the same changed bytes, and the two engines agree. The
+mutation that made 32-bit in-line stores write 8 bytes was missed for that
+reason. Every logged write now also keeps the 16 bytes around it, before the
+write and as each engine left them, and those are compared too:
+
+```
+rashid: jit and interpreter disagree at 0x1041ad000
+  bytes around the write to 0x1041af000 differ:
+    jit    c3c3c3c3a5a5a5a5210000002c000000
+    interp c3c3c3c316000000210000002c000000
+```
+
+Even then the mutation was caught only after `tests/jitint.c` gained stores
+from registers with something in their upper half into memory whose
+neighbours are not zero; until then the extra bytes written had always been
+the bytes already there.
+
 #### What would move it further
 
-`mem` did not move with the second change, because what it has left is the
-call into the interpreter for every load and store, with its permission
-check; an inline path for the common case is the next step there. After
-that: going from one block to the next without returning to the dispatcher,
-guest registers in host registers, 16-bit operands and the `0x66` prefix,
-and the SSE long tail. Each is a separate change, because each needs its own
-mutations.
+Going from one block to the next without returning to the dispatcher, which
+is what is left in `int` and `flt`; guest registers in host registers; 16-bit
+operands and the `0x66` prefix; and the SSE long tail. Each is a separate
+change, because each needs its own mutations.
 
 #### Checking the checker
 
 A verifier that never fails proves nothing, so `make jit-mutations` breaks
-the compiler thirty ways on purpose — an index scale off by one,
+the compiler thirty-six ways on purpose — an index scale off by one,
 RIP-relative addresses measured from the wrong place, an inverted branch, a
 32-bit add done at 64 bits, a push that forgets to move `rsp`, a `cmp` that
 writes its result, `min` returning the wrong operand on NaN, the `le`
@@ -649,8 +710,11 @@ integer converted as 64-bit, `andnot` with its operands swapped, `sqrt` of
 the wrong register, a byte write that clears its register, `ah` read and
 written as `al`, `movsx` widened as `movzx`, a shift count left unmasked, a
 shift by zero done anyway, a shift taking its count from the wrong register,
-a 32-bit multiply done at 64 bits, `setcc` inverted, and the eight flag
-mutations above — and requires `-J` to catch every one.
+a 32-bit multiply done at 64 bits, `setcc` inverted, the eight flag
+mutations above, and six for in-line memory — either region bound taken as
+inclusive, a region kept after `mprotect`, an in-line store not logged, a
+32-bit in-line load or store made at 64 bits — and requires `-J` to catch
+every one.
 
 Getting there turned up these, each a way a passing test was not evidence:
 

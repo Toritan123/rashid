@@ -49,7 +49,13 @@ static int find(const rsd_as *as, uint64_t a) {
     return -1;
 }
 
+static void forget(rsd_as *as) {
+    memset(as->rd, 0, sizeof as->rd);
+    memset(as->wr, 0, sizeof as->wr);
+}
+
 static int insert(rsd_as *as, uint64_t start, uint64_t end, int prot) {
+    forget(as);
     if (as->n == as->cap) {
         int cap = as->cap ? as->cap * 2 : 16;
         rsd_region *r = realloc(as->reg, (size_t)cap * sizeof *r);
@@ -104,10 +110,12 @@ int rsd_as_protect(rsd_as *as, uint64_t at, uint64_t len, int prot) {
     // 4K boundaries, so one host page routinely spans segments with different
     // permissions - rounding a protection outward would silently make the
     // neighbouring segment unwritable. Permissions are recorded per guest
-    // region instead and enforced by rsd_as_ok() on every access. The JIT
-    // will need a real answer here, since it cannot afford a software check.
+    // region instead and enforced by rsd_as_ok() on every access; compiled
+    // code makes that check in line for regions it has just used, which is
+    // why changing them has to forget those.
     rsd_region *out = malloc((size_t)(as->n * 3 + 1) * sizeof *out);
     if (!out) return -1;
+    forget(as);
     int m = 0;
     for (int i = 0; i < as->n; i++) {
         rsd_region r = as->reg[i];
@@ -131,6 +139,7 @@ int rsd_as_unmap(rsd_as *as, uint64_t at, uint64_t len) {
     uint64_t hi = (at + len + hp - 1) & ~(hp - 1);
     if (munmap((void *)(uintptr_t)lo, (size_t)(hi - lo)) < 0)
         return -1;
+    forget(as);
     for (int i = 0; i < as->n; i++) {
         if (as->reg[i].start >= lo && as->reg[i].end <= hi) {
             memmove(&as->reg[i], &as->reg[i + 1],
@@ -139,6 +148,19 @@ int rsd_as_unmap(rsd_as *as, uint64_t at, uint64_t len) {
         }
     }
     return 0;
+}
+
+void rsd_as_note(rsd_as *as, uint64_t a, int prot) {
+    int i = find(as, a);
+    if (i < 0 || (as->reg[i].prot & prot) != prot) return;
+    uint64_t len = as->reg[i].end - as->reg[i].start;
+    if (len < 8) return;
+    struct rsd_as_hit *h = (prot == RSD_PROT_R) ? as->rd : (prot == RSD_PROT_W) ? as->wr : NULL;
+    if (!h || h[0].lo == as->reg[i].start) return;
+    // The newest goes first; lim = len - 7, since the last offset an 8-byte
+    // access can start at is len - 8.
+    h[1] = h[0];
+    h[0] = (struct rsd_as_hit){ as->reg[i].start, len - 7 };
 }
 
 bool rsd_as_mapped(const rsd_as *as, uint64_t a, uint64_t n) {

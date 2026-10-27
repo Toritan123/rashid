@@ -280,6 +280,25 @@ __attribute__((noinline)) static unsigned long muls(unsigned long h) {
     return h;
 }
 
+// A store writes its own width and no more, whatever is in the rest of the
+// register it comes from. Every neighbour starts nonzero, so a store that
+// is too wide changes something; and the stores repeat, so all but the first
+// are made in line by compiled code.
+__attribute__((noinline)) static unsigned long narrow_stores(unsigned long h) {
+    static unsigned words[9] = { 11, 22, 33, 44, 55, 66, 77, 88, 99 };
+    static unsigned char bytes8[9] = { 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    for (int k = 0; k < 8; k++) {
+        __asm__ volatile("movabsq $0xa5a5a5a5c3c3c3c3, %%rax\n\t"
+                         "addq %2, %%rax\n\t"
+                         "movl %%eax, (%0)\n\t"
+                         "movb %%al, (%1)"
+                         : : "r"(&words[k]), "r"(&bytes8[k]), "r"((unsigned long)k)
+                         : "rax", "memory");
+    }
+    for (int k = 0; k < 9; k++) { h = mix(h, words[k]); h = mix(h, bytes8[k]); }
+    return h;
+}
+
 int main(void) {
     unsigned long h = 0xcbf29ce484222325UL;
     h = bytes(h);
@@ -288,6 +307,7 @@ int main(void) {
     h = immediates(h);
     h = shifts(h);
     h = muls(h);
+    h = narrow_stores(h);
     for (int i = 0; i < 64; i++) h = mix(h, ub[i] ^ ((unsigned long)(unsigned char)sb[i] << 8));
     printf("checksum=%016lx\n", h);
     return (int)(h & 0x7f);

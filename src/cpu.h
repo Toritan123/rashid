@@ -36,10 +36,18 @@ enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI,
 // sequences are then compared, because re-running a read-modify-write on
 // memory that has already been modified would check nothing.
 #define RSD_WLOG_MAX 512
+// Each write also keeps the 16 bytes from its address, before it and, for
+// the compiled run, after the whole block: a store wider than it says it is
+// changes bytes no log entry names, and only a window around each write
+// shows that. `span` is 16, or the write's own size where 16 bytes from it
+// are not all guest memory.
 struct rsd_writelog {
     int n;
     bool overflow;
-    struct { uint64_t addr, old, val; int size; } e[RSD_WLOG_MAX];
+    struct {
+        uint64_t addr, old, val; int size, span;
+        uint8_t before[16], after[16];
+    } e[RSD_WLOG_MAX];
 };
 
 typedef union {
@@ -68,7 +76,7 @@ typedef struct {
 
     struct rsd_jit *jit;  // compiled blocks, NULL when interpreting only
     bool     jit_check;   // run both engines and compare
-    uint64_t jit_tmp[4];  // scratch that compiled code keeps across calls
+    uint64_t jit_tmp[8];  // scratch that compiled code keeps across calls
     struct rsd_writelog *wlog; // records guest memory writes while checking
 
     rsd_as  *as;          // guest address space

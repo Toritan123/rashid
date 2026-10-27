@@ -9,17 +9,19 @@
 # date. That exact thing produced a misleading result while this was written.
 set -u
 cd "$(dirname "$0")/.."
-SRC=src/jit.c
+SRCS=(src/jit.c src/as.c)
 # A mutation counts as caught if -J objects on any of these.
-GUESTS=("tests/jit.x86" "tests/jitsse.x86" "tests/jitint.x86" "tests/bench.x86 flt 2000")
+GUESTS=("tests/jit.x86" "tests/jitsse.x86" "tests/jitint.x86" "tests/bench.x86 flt 2000"
+        "tests/jitmem.x86 e" "tests/jitmem.x86 s" "tests/jitmem.x86 p")
 for g in "${GUESTS[@]}"; do
     f=${g%% *}
     [ -x "$f" ] || { echo "build $f first"; exit 1; }
 done
 
-orig=$(mktemp)
-cp "$SRC" "$orig"
-trap 'cp "$orig" "$SRC"; rm -f rashid; make -s >/dev/null 2>&1; rm -f "$orig"' EXIT
+orig=$(mktemp -d)
+for f in "${SRCS[@]}"; do cp "$f" "$orig/$(basename "$f")"; done
+restore() { for f in "${SRCS[@]}"; do cp "$orig/$(basename "$f")" "$f"; done; }
+trap 'restore; rm -f rashid; make -s >/dev/null 2>&1; rm -rf "$orig"' EXIT
 
 rebuild() { rm -f rashid; make -s >/dev/null 2>&1; }
 
@@ -42,11 +44,11 @@ base=$(check)
 printf '  %-34s %s\n' "unmodified compiler" "$base"
 [ "$base" = agree ] || { echo "  the unmodified compiler must agree"; exit 1; }
 
-mutate() {  # name, perl substitution
-    local name=$1 expr=$2
-    cp "$orig" "$SRC"
-    perl -0777 -pi -e "$expr" "$SRC"
-    if cmp -s "$orig" "$SRC"; then
+mutate() {  # name, perl substitution, file (src/jit.c by default)
+    local name=$1 expr=$2 src=${3:-src/jit.c}
+    restore
+    perl -0777 -pi -e "$expr" "$src"
+    if cmp -s "$orig/$(basename "$src")" "$src"; then
         printf '  %-34s MUTATION DID NOT APPLY\n' "$name"; fail=1; return
     fi
     rebuild
@@ -124,10 +126,23 @@ mutate "32-bit flags taken at 64 bits" \
   's{put_flags_inline\(b, fn, o->fneed, size == 4\)}{put_flags_inline(b, fn, o->fneed, false)}'
 mutate "le tested without zf" \
   's{(\Q// zf | sf != of\E.*?put\(b, a64_eor\(A64_X0, A64_X0, A64_X10\)\);)\n\s*put\(b, a64_ubfx\(A64_X10, A64_X9, 6, 1\)\);\n\s*put\(b, a64_orr\(A64_X0, A64_X0, A64_X10\)\);}{$1}s'
+# in-line memory accesses
+mutate "region check inclusive, first entry" \
+  's{put_patch_bcond\(b, hit, A64_CC\)}{put_patch_bcond(b, hit, A64_LS)}'
+mutate "region check inclusive, second entry" \
+  's{put_patch_bcond\(b, slow, A64_CS\)}{put_patch_bcond(b, slow, A64_HI)}'
+mutate "mprotect keeps the region cache" \
+  's{(if \(!out\) return -1;)\n    forget\(as\);}{$1}' src/as.c
+mutate "in-line store not logged" \
+  's{if \(b->check\) \{}{if (0) \{}'
+mutate "in-line 32-bit load takes 64" \
+  's{case 4:  put\(b, a64_ldr_w\(A64_X0, A64_X1, 0\)\);}{case 4:  put(b, a64_ldr(A64_X0, A64_X1, 0));}'
+mutate "in-line 32-bit store writes 64" \
+  's{case 4:  put\(b, a64_str_w\(A64_X2, A64_X1, 0\)\);}{case 4:  put(b, a64_str(A64_X2, A64_X1, 0));}'
 mutate "setcc inverted" \
   's{o->cc = op2 & 0xF;}{o->cc = (op2 & 0xF) ^ 1;}'
 
-cp "$orig" "$SRC"
+restore
 rebuild
 after=$(check)
 printf '  %-34s %s\n' "restored compiler" "$after"

@@ -122,6 +122,19 @@ static inline uint32_t a64_mul_w(int d, int n, int m) {
     return 0x1B007C00u | ((uint32_t)m << 16) | ((uint32_t)n << 5) | (uint32_t)d;
 }
 
+// ldrh / strh Wt, [Xn, #off]   (off a multiple of 2)
+static inline uint32_t a64_ldrh(int t, int n, uint32_t off) {
+    return 0x79400000u | ((off / 2) << 10) | ((uint32_t)n << 5) | (uint32_t)t;
+}
+static inline uint32_t a64_strh(int t, int n, uint32_t off) {
+    return 0x79000000u | ((off / 2) << 10) | ((uint32_t)n << 5) | (uint32_t)t;
+}
+
+// b <pc + 4*imm26>
+static inline uint32_t a64_b(int32_t imm26) {
+    return 0x14000000u | ((uint32_t)imm26 & 0x3FFFFFFu);
+}
+
 // ldrb Wt, [Xn, #off]
 static inline uint32_t a64_ldrb(int t, int n, uint32_t off) {
     return 0x39400000u | (off << 10) | ((uint32_t)n << 5) | (uint32_t)t;

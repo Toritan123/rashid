@@ -29,7 +29,9 @@
 // regions rashid has handed to the guest, with their permissions. The
 // interpreter checks accesses against it, which turns a wild guest pointer
 // into a precise report instead of a crash somewhere later. It is a debugging
-// aid, not a sandbox; the JIT will let the host MMU do this work.
+// aid, not a sandbox. Compiled code makes the same check, in line for the
+// regions it has recently succeeded in and through the interpreter's routine
+// otherwise.
 #ifndef RASHID_AS_H
 #define RASHID_AS_H
 
@@ -50,6 +52,14 @@ typedef struct {
 typedef struct {
     rsd_region *reg;
     int         n, cap;
+    // The last two regions compiled loads, and compiled stores, succeeded
+    // in, so the next access there can be made in line instead of through a
+    // call. Two, because code that writes to its data and calls a function
+    // writes to two regions in turn, and one entry would miss every time.
+    // Each is a start and a bound: an access of up to 8 bytes at a is inside
+    // when a - lo < lim. An empty entry has lim 0, which nothing is below.
+    // Any change to the regions empties them all.
+    struct rsd_as_hit { uint64_t lo, lim; } rd[2], wr[2];
 } rsd_as;
 
 int  rsd_as_init(rsd_as *as);
@@ -64,6 +74,10 @@ int      rsd_as_unmap(rsd_as *as, uint64_t at, uint64_t len);
 // Is [a, a+n) guest memory, and does it allow `prot`?
 bool rsd_as_ok(const rsd_as *as, uint64_t a, uint64_t n, int prot);
 bool rsd_as_mapped(const rsd_as *as, uint64_t a, uint64_t n);
+
+// Remember the region holding a, if it allows prot, for compiled code's
+// in-line accesses. Only RSD_PROT_R and RSD_PROT_W are remembered.
+void rsd_as_note(rsd_as *as, uint64_t a, int prot);
 
 void rsd_as_dump(const rsd_as *as);
 

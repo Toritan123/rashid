@@ -85,6 +85,9 @@ static void log_write(rsd_cpu *c, uint64_t a, const void *h, uint64_t v, int siz
     if (w->n >= RSD_WLOG_MAX) { w->overflow = true; return; }
     uint64_t old = 0;
     memcpy(&old, h, (size_t)size);
+    int span = rsd_as_ok(c->as, a, 16, RSD_PROT_R) ? 16 : size;
+    w->e[w->n].span = span;
+    memcpy(w->e[w->n].before, h, (size_t)span);
     w->e[w->n].addr = a;  w->e[w->n].size = size;
     w->e[w->n].old = old; w->e[w->n].val = v & (size == 8 ? ~0ull
                                          : ((1ull << (size * 8)) - 1));
@@ -442,11 +445,22 @@ static void do_syscall(rsd_cpu *c) {
 // permissions are where an interpreter and a compiler most easily drift
 // apart, so there is only one copy of each.
 
+// Compiled code's loads and stores. When one succeeds, its region is noted
+// so the next access there can be made in line; the check that decides it
+// is in rsd_as_ok, the same one the interpreter makes.
 uint64_t rsd_i_ld(rsd_cpu *c, uint64_t a, uint64_t size) {
-    return ld(c, a, (int)size);
+    uint64_t v = ld(c, a, (int)size);
+    if (!c->fault) rsd_as_note(c->as, a, RSD_PROT_R);
+    return v;
 }
 void rsd_i_st(rsd_cpu *c, uint64_t a, uint64_t v, uint64_t size) {
     st(c, a, v, (int)size);
+    if (!c->fault) rsd_as_note(c->as, a, RSD_PROT_W);
+}
+// An in-line store about to happen, logged while blocks are being checked,
+// since it does not pass through st().
+void rsd_i_wlog(rsd_cpu *c, uint64_t a, uint64_t v, uint64_t size) {
+    log_write(c, a, rsd_g2h(c->as, a), v, (int)size);
 }
 void rsd_i_flags_add(rsd_cpu *c, uint64_t a, uint64_t b, uint64_t r, uint64_t size) {
     flags_add(c, a, b, r, (int)size);
@@ -1765,7 +1779,7 @@ void rsd_cpu_free(rsd_cpu *c) {
 // actually goes wrong.
 static void undo_writes(const struct rsd_writelog *w) {
     for (int i = w->n - 1; i >= 0; i--)
-        memcpy((void *)(uintptr_t)w->e[i].addr, &w->e[i].old, (size_t)w->e[i].size);
+        memcpy((void *)(uintptr_t)w->e[i].addr, w->e[i].before, (size_t)w->e[i].span);
 }
 
 static bool run_block(rsd_cpu *c, void *body, uint32_t ninsn) {
@@ -1783,6 +1797,9 @@ static bool run_block(rsd_cpu *c, void *body, uint32_t ninsn) {
     c->rip = rsd_jit_enter(c, body);
     c->wlog = NULL;
     rsd_cpu after = *c;
+    for (int i = 0; !jit_log.overflow && i < jit_log.n; i++)
+        memcpy(jit_log.e[i].after, (void *)(uintptr_t)jit_log.e[i].addr,
+               (size_t)jit_log.e[i].span);
 
     // Put memory back the way the block found it, then replay.
     undo_writes(&jit_log);
@@ -1805,6 +1822,11 @@ static bool run_block(rsd_cpu *c, void *body, uint32_t ninsn) {
         mem_ok = jit_log.e[i].addr == int_log.e[i].addr &&
                  jit_log.e[i].size == int_log.e[i].size &&
                  jit_log.e[i].val  == int_log.e[i].val;
+    // And the bytes around each write, as each engine left them.
+    int window = -1;
+    for (int i = 0; mem_ok && !jit_log.overflow && i < jit_log.n; i++)
+        if (memcmp(jit_log.e[i].after, (void *)(uintptr_t)jit_log.e[i].addr,
+                   (size_t)jit_log.e[i].span)) { mem_ok = false; window = i; }
 
     if (!ok || !mem_ok) {
         fprintf(stderr, "rashid: jit and interpreter disagree at 0x%llx\n", before.rip);
@@ -1822,6 +1844,16 @@ static bool run_block(rsd_cpu *c, void *body, uint32_t ninsn) {
             if (memcmp(&c->xmm[i], &after.xmm[i], 16))
                 fprintf(stderr, "  xmm%-2d jit=%016llx%016llx interp=%016llx%016llx\n", i,
                         after.xmm[i].q[1], after.xmm[i].q[0], c->xmm[i].q[1], c->xmm[i].q[0]);
+        if (window >= 0) {
+            const uint8_t *now = (const uint8_t *)(uintptr_t)jit_log.e[window].addr;
+            fprintf(stderr, "  bytes around the write to 0x%llx differ:\n    jit    ",
+                    jit_log.e[window].addr);
+            for (int k = 0; k < jit_log.e[window].span; k++)
+                fprintf(stderr, "%02x", jit_log.e[window].after[k]);
+            fprintf(stderr, "\n    interp ");
+            for (int k = 0; k < jit_log.e[window].span; k++) fprintf(stderr, "%02x", now[k]);
+            fprintf(stderr, "\n");
+        }
         if (!mem_ok) {
             fprintf(stderr, "  memory writes jit=%d interp=%d\n", jit_log.n, int_log.n);
             int m = jit_log.n > int_log.n ? jit_log.n : int_log.n;

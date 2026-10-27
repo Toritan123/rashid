@@ -23,6 +23,7 @@
 #ifndef RASHID_EMIT_H
 #define RASHID_EMIT_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 enum { A64_X0 = 0, A64_X1, A64_X2, A64_X3, A64_X4, A64_X5, A64_X6, A64_X7,
@@ -180,6 +181,39 @@ static inline uint32_t a64_csetm(int d, int cond) {
 }
 static inline uint32_t a64_csetm_w(int d, int cond) {
     return 0x5A9F03E0u | ((uint32_t)(cond ^ 1) << 12) | (uint32_t)d;
+}
+
+// Flag-setting forms with the result discarded: cmn, cmp and tst.
+//   adds/subs/ands  zr, Xn|Wn, Xm|Wm
+static inline uint32_t a64_adds_zr(int n, int m, bool w) {
+    return (w ? 0x2B00001Fu : 0xAB00001Fu) | ((uint32_t)m << 16) | ((uint32_t)n << 5);
+}
+static inline uint32_t a64_subs_zr(int n, int m, bool w) {
+    return (w ? 0x6B00001Fu : 0xEB00001Fu) | ((uint32_t)m << 16) | ((uint32_t)n << 5);
+}
+static inline uint32_t a64_ands_zr(int n, int m, bool w) {
+    return (w ? 0x6A00001Fu : 0xEA00001Fu) | ((uint32_t)m << 16) | ((uint32_t)n << 5);
+}
+
+// orr Xd, Xn, Xm, lsl #sh   and   eor Xd, Xn, Xm, lsr #sh
+static inline uint32_t a64_orr_lsl(int d, int n, int m, int sh) {
+    return 0xAA000000u | ((uint32_t)m << 16) | ((uint32_t)sh << 10) | ((uint32_t)n << 5) | (uint32_t)d;
+}
+static inline uint32_t a64_eor_lsr(int d, int n, int m, int sh) {
+    return 0xCA400000u | ((uint32_t)m << 16) | ((uint32_t)sh << 10) | ((uint32_t)n << 5) | (uint32_t)d;
+}
+
+// eor Xd, Xn, #(1 << k) - a single-bit logical immediate is a one rotated
+// right by 64 - k
+static inline uint32_t a64_eor_bit(int d, int n, int k) {
+    return 0xD2400000u | ((uint32_t)((64 - k) & 63) << 16) | ((uint32_t)n << 5) | (uint32_t)d;
+}
+
+enum { A64_CS = 2, A64_CC = 3 };
+
+// cset Xd, cond: 1 if cond holds, else zero (csinc with the inverted condition)
+static inline uint32_t a64_cset(int d, int cond) {
+    return 0x9A9F07E0u | ((uint32_t)(cond ^ 1) << 12) | (uint32_t)d;
 }
 
 // --- floating point -----------------------------------------------------

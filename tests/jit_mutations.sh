@@ -66,7 +66,7 @@ mutate "index scale off by one" \
 mutate "rip-relative measured from start" \
   's{put_imm\(b, A64_X1, o->next \+ \(uint64_t\)o->disp\)}{put_imm(b, A64_X1, o->next - 4 + (uint64_t)o->disp)}'
 mutate "conditional branch inverted" \
-  's{a64_csel\(A64_X0, A64_X2, A64_X3, A64_NE\)}{a64_csel(A64_X0, A64_X2, A64_X3, A64_EQ)}'
+  's{a64_csel\(A64_X0, A64_X2, A64_X3, \(o->cc & 1\) \? A64_EQ : A64_NE\)}{a64_csel(A64_X0, A64_X2, A64_X3, (o->cc & 1) ? A64_NE : A64_EQ)}'
 mutate "32-bit add done at 64 bits" \
   's{w \? a64_add_w\(A64_X3, A64_X1, A64_X2\) : a64_add}{w ? a64_add(A64_X3, A64_X1, A64_X2) : a64_add}'
 mutate "push forgets to move rsp" \
@@ -107,6 +107,23 @@ mutate "shift by cl takes rdx" \
   's{put\(b, a64_ldr\(A64_X5, CPU, off_r\(1\)\)\);}{put(b, a64_ldr(A64_X5, CPU, off_r(2)));}'
 mutate "32-bit multiply done at 64 bits" \
   's{o->size == 8 \? a64_mul\(A64_X3, A64_X1, A64_X2\)\n                            : a64_mul_w\(A64_X3, A64_X1, A64_X2\)}{a64_mul(A64_X3, A64_X1, A64_X2)}s'
+# flags: which are computed, and how
+mutate "liveness ignores readers" \
+  's{live = \(live & ~w\) \| flags_read\(&v\[i\]\);}{live = live & ~w;}'
+mutate "inc said to write CF" \
+  's{#define FL_INC   \(FL_ALL & ~F_CF\)}{#define FL_INC   FL_ALL}'
+mutate "shift by cl said to write flags" \
+  's{return \(o->by_cl \|\| !}{return (!o->by_cl && !}'
+mutate "borrow taken as arm64 carry" \
+  's{sub \? A64_CC : A64_CS}{A64_CS}'
+mutate "parity inverted" \
+  's{put\(b, a64_eor_bit\(A64_X11, A64_X11, 0\)\);}{}'
+mutate "nibble carry from bit 5" \
+  's{a64_ubfx\(A64_X11, A64_X11, 4, 1\)}{a64_ubfx(A64_X11, A64_X11, 5, 1)}'
+mutate "32-bit flags taken at 64 bits" \
+  's{put_flags_inline\(b, fn, o->fneed, size == 4\)}{put_flags_inline(b, fn, o->fneed, false)}'
+mutate "le tested without zf" \
+  's{(\Q// zf | sf != of\E.*?put\(b, a64_eor\(A64_X0, A64_X0, A64_X10\)\);)\n\s*put\(b, a64_ubfx\(A64_X10, A64_X9, 6, 1\)\);\n\s*put\(b, a64_orr\(A64_X0, A64_X0, A64_X10\)\);}{$1}s'
 mutate "setcc inverted" \
   's{o->cc = op2 & 0xF;}{o->cc = (op2 & 0xF) ^ 1;}'
 

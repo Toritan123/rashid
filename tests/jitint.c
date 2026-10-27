@@ -216,6 +216,17 @@ __attribute__((noinline)) static unsigned long shifts(unsigned long h) {
         // one, so neither is compared where the manual does not define it.
         unsigned long m = (cl == 1) ? 0x8c5 : 0x0c5;
         for (int i = 0; i < 4; i++) { h = mix(h, o[i]); h = mix(h, fl[i] & m); }
+        // A shift by cl that comes out zero leaves the flags of whatever came
+        // before it, so it must not be taken as overwriting them.
+        {
+            unsigned long r, f;
+            __asm__ volatile("movq %2, %%rax\n\t movb %3, %%cl\n\t cmpq $0x5a5a, %%rax\n\t"
+                             "shlq %%cl, %%rax\n\t movq %%rax, %0\n\t pushfq\n\t popq %1\n\t"
+                             : "=&r"(r), "=&r"(f) : "r"(a), "r"((unsigned char)cl)
+                             : "rax", "rcx", "cc");
+            h = mix(h, r);
+            h = mix(h, f & ((cl & 63) ? m : 0x8d5));
+        }
         // By a constant, which the compiler resolves while compiling.
         // The three shifts by zero come after a compare and before the
         // flags are read, because a shift by zero is only observable in the

@@ -82,6 +82,7 @@ static uint32_t off_tmp(int i) { return (uint32_t)(offsetof(rsd_cpu, jit_tmp) + 
 static uint32_t off_xmm(int i) { return (uint32_t)(offsetof(rsd_cpu, xmm) + (size_t)i * 16); }
 #define OFF_CURRIP  ((uint32_t)offsetof(rsd_cpu, cur_rip))
 #define OFF_RUNNING ((uint32_t)offsetof(rsd_cpu, running))
+#define OFF_FLAGS   ((uint32_t)offsetof(rsd_cpu, flags))
 
 // Which instruction is executing, so a fault inside a helper is reported
 // against it rather than against wherever the block began.
@@ -134,6 +135,7 @@ typedef struct {
     int      ext;               // shifts: the modrm extension that names one
     bool     by_cl, imm_src;
     int      cc;
+    uint32_t fneed;             // the flags a later reader wants from this one
     uint64_t next, target;
     // SSE: mandatory prefix, second opcode byte, xmm destination, xmm or
     // general register source, integer width for conversions, cmp predicate
@@ -421,6 +423,88 @@ static int decode(const uint8_t *p, uint64_t rip, insn *o) {
     return n;
 }
 
+// --- which flags are worth computing ---------------------------------
+// Most flags are never read. An add is usually followed by a cmp or a test
+// that overwrites everything it set, and calling the interpreter's flag
+// routine for it is most of what compiled integer code used to spend its
+// time on. So each block is first walked backwards to find, for every
+// instruction, the flags something later actually reads; one whose answer
+// is none skips the flag routine altogether.
+//
+// Everything is live where the block ends, because the next block, or the
+// interpreter, may read anything. Nothing is live at a fault: a guest fault
+// ends the run, and -J accepts any state when both engines fault.
+
+#define FL_ALL   (F_CF | F_PF | F_AF | F_ZF | F_SF | F_OF)
+#define FL_LOGIC (FL_ALL & ~F_AF)    // and/or/xor/test/imul/shift leave AF alone here
+#define FL_INC   (FL_ALL & ~F_CF)    // inc and dec leave CF alone
+
+static uint32_t cc_reads(int cc) {
+    static const uint32_t r[8] = {
+        F_OF, F_CF, F_ZF, F_CF | F_ZF, F_SF, F_PF, F_SF | F_OF, F_ZF | F_SF | F_OF };
+    return r[(cc >> 1) & 7];
+}
+
+// The flags an instruction is certain to overwrite. "Certain" matters: a
+// shift by cl writes nothing when cl is zero, so it kills nothing.
+static uint32_t flags_written(const insn *o) {
+    switch (o->kind) {
+    case K_RR: case K_RI: case K_RM: case K_MR: case K_MI:
+        switch (o->op) {
+        case 0x88:                      return 0;
+        case 0x00: case 0x28: case 0x38: return FL_ALL;
+        case OP_INC: case OP_DEC:       return FL_INC;
+        default:                        return FL_LOGIC;
+        }
+    case K_IMUL:
+        return FL_LOGIC;
+    case K_SHIFT:
+        return (o->by_cl || !(o->imm & (o->size == 8 ? 63u : 31u))) ? 0 : FL_LOGIC;
+    default:
+        return 0;
+    }
+}
+
+static uint32_t flags_read(const insn *o) {
+    return (o->kind == K_JCC || o->kind == K_SETCC) ? cc_reads(o->cc) : 0;
+}
+
+static void flag_liveness(insn *v, int n) {
+    uint32_t live = FL_ALL;
+    for (int i = n - 1; i >= 0; i--) {
+        uint32_t w = flags_written(&v[i]);
+        v[i].fneed = w & live;
+        live = (live & ~w) | flags_read(&v[i]);
+    }
+}
+
+// Whether condition cc holds, as 0 or 1 in x0, read from the flags word
+// directly rather than through a call. Conditions come in pairs that differ
+// only in sense; this computes the even one, and callers select on the
+// inverse for the odd one.
+static void put_cond_even(buf *b, int cc) {
+    put(b, a64_ldr_w(A64_X9, CPU, OFF_FLAGS));
+    switch ((cc >> 1) & 7) {
+    case 0: put(b, a64_ubfx(A64_X0, A64_X9, 11, 1)); break;            // of
+    case 1: put(b, a64_ubfx(A64_X0, A64_X9, 0, 1));  break;            // cf
+    case 2: put(b, a64_ubfx(A64_X0, A64_X9, 6, 1));  break;            // zf
+    case 3: put(b, a64_ubfx(A64_X0, A64_X9, 0, 1));                    // cf | zf
+            put(b, a64_ubfx(A64_X10, A64_X9, 6, 1));
+            put(b, a64_orr(A64_X0, A64_X0, A64_X10)); break;
+    case 4: put(b, a64_ubfx(A64_X0, A64_X9, 7, 1));  break;            // sf
+    case 5: put(b, a64_ubfx(A64_X0, A64_X9, 2, 1));  break;            // pf
+    case 6: put(b, a64_ubfx(A64_X0, A64_X9, 7, 1));                    // sf != of
+            put(b, a64_ubfx(A64_X10, A64_X9, 11, 1));
+            put(b, a64_eor(A64_X0, A64_X0, A64_X10)); break;
+    default:put(b, a64_ubfx(A64_X0, A64_X9, 7, 1));                    // zf | sf != of
+            put(b, a64_ubfx(A64_X10, A64_X9, 11, 1));
+            put(b, a64_eor(A64_X0, A64_X0, A64_X10));
+            put(b, a64_ubfx(A64_X10, A64_X9, 6, 1));
+            put(b, a64_orr(A64_X0, A64_X0, A64_X10)); break;
+    }
+    put(b, a64_cmp0(A64_X0));
+}
+
 // --- the guest register file -----------------------------------------
 // Reading a register wider than the operand is harmless: add, sub and the
 // bitwise operations never carry information downwards, and the flag
@@ -497,9 +581,66 @@ static void *put_op(buf *b, const insn *o) {
     return NULL;
 }
 
+// The flags of an add, sub, logical operation, inc or dec, computed in line
+// from arm64's own: the operation is repeated in its flag-setting form, so
+// N, Z, C and V come out for the right width, and x86's CF, ZF, SF and OF
+// are read off them. arm64 has no parity or nibble carry, so PF and AF are
+// computed from the operands. Only the flags in `need` are produced; the
+// rest are left as they were, which is safe because nothing reads them
+// before an instruction later in the block overwrites them.
+//
+// This is a second definition of what these flags mean, alongside the
+// interpreter's. The interpreter's is still the reference: -J compares the
+// two after every block, and the mutations check that it notices.
+static bool put_flags_inline(buf *b, void *fn, uint32_t need, bool w) {
+    bool add = fn == (void *)rsd_i_flags_add || fn == (void *)rsd_i_flags_inc;
+    bool sub = fn == (void *)rsd_i_flags_sub || fn == (void *)rsd_i_flags_dec;
+    bool logic = fn == (void *)rsd_i_flags_logic;
+    if (!add && !sub && !logic) return false;
+
+    if (need & (F_CF | F_ZF | F_SF | F_OF)) {
+        if (add)      put(b, a64_adds_zr(A64_X1, A64_X2, w));
+        else if (sub) put(b, a64_subs_zr(A64_X1, A64_X2, w));
+        else          put(b, a64_ands_zr(A64_X3, A64_X3, w));
+    }
+    put(b, a64_movz(A64_X10, 0, 0));
+    // A borrow is arm64's carry clear. A logical operation clears CF and OF,
+    // which the merge below does by leaving their bits at zero.
+    static const struct { uint32_t f; int bit; } nzcv[4] = {
+        { F_CF, 0 }, { F_ZF, 6 }, { F_SF, 7 }, { F_OF, 11 } };
+    int cond[4] = { sub ? A64_CC : A64_CS, A64_EQ, A64_MI, A64_VS };
+    for (int i = 0; i < 4; i++) {
+        if (!(need & nzcv[i].f) || (logic && (nzcv[i].f & (F_CF | F_OF)))) continue;
+        put(b, a64_cset(A64_X11, cond[i]));
+        put(b, a64_orr_lsl(A64_X10, A64_X10, A64_X11, nzcv[i].bit));
+    }
+    if (need & F_PF) {                          // set when the low byte has even parity
+        put(b, a64_eor_lsr(A64_X11, A64_X3, A64_X3, 4));
+        put(b, a64_eor_lsr(A64_X11, A64_X11, A64_X11, 2));
+        put(b, a64_eor_lsr(A64_X11, A64_X11, A64_X11, 1));
+        put(b, a64_ubfx(A64_X11, A64_X11, 0, 1));
+        put(b, a64_eor_bit(A64_X11, A64_X11, 0));
+        put(b, a64_orr_lsl(A64_X10, A64_X10, A64_X11, 2));
+    }
+    if (need & F_AF) {                          // the carry out of bit 3
+        put(b, a64_eor(A64_X11, A64_X1, A64_X2));
+        put(b, a64_eor(A64_X11, A64_X11, A64_X3));
+        put(b, a64_ubfx(A64_X11, A64_X11, 4, 1));
+        put(b, a64_orr_lsl(A64_X10, A64_X10, A64_X11, 4));
+    }
+    put(b, a64_ldr_w(A64_X9, CPU, OFF_FLAGS));
+    put_imm(b, A64_X12, need);
+    put(b, a64_bic(A64_X9, A64_X9, A64_X12));
+    put(b, a64_orr(A64_X9, A64_X9, A64_X10));
+    put(b, a64_str_w(A64_X9, CPU, OFF_FLAGS));
+    return true;
+}
+
 // Operands are still in x1, x2 and x3, which is where the helpers want them.
-static void put_flags(buf *b, void *fn, int size) {
-    if (!fn) return;
+// Byte operations go to the helper: arm64 has no 8-bit flag-setting forms.
+static void put_flags(buf *b, const insn *o, void *fn, int size) {
+    if (!fn || !o->fneed) return;
+    if (size != 1 && put_flags_inline(b, fn, o->fneed, size == 4)) return;
     put(b, a64_mov(A64_X0, CPU));
     if (fn == (void *)rsd_i_flags_logic) {
         put(b, a64_mov(A64_X1, A64_X3));
@@ -781,7 +922,7 @@ static void put_insn(buf *b, const insn *o, uint64_t rip) {
         else                 put_rd_reg(b, A64_X2, o, o->src, o->size);
         fl = put_op(b, o);
         if (!o->no_write) put_wr_reg(b, A64_X3, o, o->reg, o->size);
-        put_flags(b, fl, o->size);
+        put_flags(b, o, fl, o->size);
         return;
 
     case K_RM:                                  // reg = reg op [mem]
@@ -792,7 +933,7 @@ static void put_insn(buf *b, const insn *o, uint64_t rip) {
         put_rd_reg(b, A64_X1, o, o->reg, o->size);
         fl = put_op(b, o);
         if (!o->no_write) put_wr_reg(b, A64_X3, o, o->reg, o->size);
-        put_flags(b, fl, o->size);
+        put_flags(b, o, fl, o->size);
         return;
 
     case K_SHIFT: {
@@ -847,13 +988,12 @@ static void put_insn(buf *b, const insn *o, uint64_t rip) {
         put(b, o->size == 8 ? a64_mul(A64_X3, A64_X1, A64_X2)
                             : a64_mul_w(A64_X3, A64_X1, A64_X2));
         put(b, a64_str(A64_X3, CPU, off_r(o->reg)));
-        put_flags(b, rsd_i_flags_logic, o->size);
+        put_flags(b, o, rsd_i_flags_logic, o->size);
         return;
 
     case K_SETCC:
-        put(b, a64_mov(A64_X0, CPU));
-        put_imm(b, A64_X1, (uint64_t)o->cc);
-        put_call(b, rsd_i_cond);
+        put_cond_even(b, o->cc);
+        put(b, a64_cset(A64_X0, (o->cc & 1) ? A64_EQ : A64_NE));
         if (o->mem) {
             put(b, a64_str(A64_X0, CPU, off_tmp(0)));
             put_set_rip(b, rip);
@@ -908,7 +1048,7 @@ static void put_insn(buf *b, const insn *o, uint64_t rip) {
             put(b, a64_ldr(A64_X2, CPU, off_tmp(2)));
             put(b, a64_ldr(A64_X3, CPU, off_tmp(3)));
         }
-        put_flags(b, fl, o->size);
+        put_flags(b, o, fl, o->size);
         return;
 
     case K_LEA:
@@ -943,13 +1083,10 @@ static void put_insn(buf *b, const insn *o, uint64_t rip) {
         return;
 
     case K_JCC:
-        put(b, a64_mov(A64_X0, CPU));
-        put_imm(b, A64_X1, (uint64_t)o->cc);
-        put_call(b, rsd_i_cond);
+        put_cond_even(b, o->cc);                // movz and movk leave nzcv alone
         put_imm(b, A64_X2, o->target);
         put_imm(b, A64_X3, o->next);
-        put(b, a64_cmp0(A64_X0));
-        put(b, a64_csel(A64_X0, A64_X2, A64_X3, A64_NE));
+        put(b, a64_csel(A64_X0, A64_X2, A64_X3, (o->cc & 1) ? A64_EQ : A64_NE));
         put_leave(b);
         return;
 
@@ -1011,6 +1148,7 @@ int rsd_jit_init(rsd_jit *j) {
     // Compiled code addresses rsd_cpu fields with scaled 12-bit offsets.
     if (off_r(15) >= 32768 || OFF_CURRIP % 8 || OFF_CURRIP >= 32768 ||
         off_tmp(3) >= 4096 || OFF_RUNNING >= 4096 ||
+        OFF_FLAGS % 4 || OFF_FLAGS >= 16384 ||
         off_xmm(0) % 8 || off_xmm(15) + 8 >= 4096) {
         fprintf(stderr, "rashid: rsd_cpu layout is out of reach of the jit\n");
         return -1;
@@ -1080,17 +1218,14 @@ void *rsd_jit_lookup(rsd_jit *j, rsd_cpu *c, uint64_t rip) {
     // Compile. The guest's code is directly readable, addresses being shared.
     if (!rsd_as_ok(c->as, rip, 16, RSD_PROT_X)) return NULL;
 
-    uint32_t words[MAX_BLOCK];
-    buf b = { .out = words, .n = 0, .max = MAX_BLOCK - 24 };
-    put(&b, a64_push(A64_X30));
-
-    uint64_t pc = rip;
+    // Decode the whole block before emitting any of it, because whether an
+    // instruction's flags are needed depends on what comes after it.
+    insn v[MAX_INSNS];
     int count = 0;
     bool ended = false;
-    for (;;) {
-        insn o;
-        if (count >= MAX_INSNS || !rsd_as_ok(c->as, pc, 16, RSD_PROT_X)) break;
-        if (!decode(rsd_g2h(c->as, pc), pc, &o)) {
+    uint64_t pc = rip;
+    while (count < MAX_INSNS && rsd_as_ok(c->as, pc, 16, RSD_PROT_X)) {
+        if (!decode(rsd_g2h(c->as, pc), pc, &v[count])) {
             if (getenv("RASHID_JIT_DEBUG")) {
                 const uint8_t *q = rsd_g2h(c->as, pc);
                 fprintf(stderr, "rashid: jit stops at 0x%llx on %02x %02x %02x\n",
@@ -1098,14 +1233,30 @@ void *rsd_jit_lookup(rsd_jit *j, rsd_cpu *c, uint64_t rip) {
             }
             break;
         }
-        int n_before = b.n, fix_before = b.nfix;
-        put_insn(&b, &o, pc);
-        if (b.full) { b.n = n_before; b.nfix = fix_before; b.full = false; break; }
-        pc = o.next;
-        count++;
-        if (terminates(o.kind)) { ended = true; break; }
+        pc = v[count].next;
+        if (terminates(v[count++].kind)) { ended = true; break; }
     }
 
+    // Emit. If the block does not fit, it is cut short where it overflowed
+    // and compiled again, since the cut changes what is live at the end.
+    uint32_t words[MAX_BLOCK];
+    buf b;
+    for (;;) {
+        flag_liveness(v, count);
+        b = (buf){ .out = words, .n = 0, .max = MAX_BLOCK - 24 };
+        put(&b, a64_push(A64_X30));
+        int i = 0;
+        uint64_t at = rip;
+        for (; i < count; i++) {
+            put_insn(&b, &v[i], at);
+            if (b.full) break;
+            at = v[i].next;
+        }
+        if (i == count) break;
+        count = i;
+        ended = false;
+        pc = at;
+    }
     // A single instruction is not worth the trip through the entry stub.
     if (count < 2) {
         j->cache[s].tag = rip; j->cache[s].code = NULL; j->bailed++; return NULL;

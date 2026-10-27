@@ -19,12 +19,11 @@
 // The interpreter costs about forty-five cycles per guest instruction, most
 // of it decoding the same bytes over and over. A block compiler decodes once.
 //
-// All guest state stays in the rsd_cpu struct and the compiler calls back
-// into the interpreter's own routines for flags and memory, so the two
-// engines cannot disagree about semantics - only about speed. Holding guest
-// registers in host registers, which would remove a load and a store per
-// operand, is the obvious next step and a separate one; lazy flags, which
-// would remove the helper call from most arithmetic, is the one after.
+// All guest state stays in the rsd_cpu struct. The compiler calls back into
+// the interpreter's own routines for memory and for the less common flags;
+// the flags of add, sub, the logical operations, inc and dec are computed in
+// line, and only when something reads them, which makes them the one place
+// the two engines have separate definitions. -J is what keeps them equal.
 //
 // Anything not understood simply ends the block, and the interpreter takes
 // over from there, so the compiler can stay small and grow by measurement.

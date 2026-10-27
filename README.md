@@ -475,11 +475,11 @@ same and replays every block through the interpreter before believing it.
 
 ```
 work      native   interp      jit  jit/interp  jit vs native
-int        13.3m   183.9m    45.0m       4.09x            3.4x
-mem        12.2m   325.0m    78.1m       4.16x            6.4x
-flt        20.7m   366.8m    40.0m       9.17x            1.9x
-hash       15.5m   465.7m    95.8m       4.86x            6.2x
-thunk      15.6m   111.2m    61.4m       1.81x            3.9x
+int        14.1m   184.8m    23.5m       7.87x            1.7x
+mem        12.8m   324.3m    41.9m       7.74x            3.3x
+flt        22.4m   368.3m    37.8m       9.74x            1.7x
+hash       14.8m   465.8m    55.4m       8.41x            3.7x
+thunk      16.0m   111.2m    52.3m       2.13x            3.3x
 ```
 
 It compiles 8-, 32- and 64-bit integer operations with register, immediate
@@ -487,14 +487,13 @@ and memory operands (base, scaled index, displacement, RIP-relative), `lea`,
 `inc`/`dec`, `push`/`pop`, shifts, `imul`, `movzx`/`movsx`, `setcc`, and ends
 blocks at `jcc`, `jmp`, `call`, `ret` and their indirect forms. Guest state
 stays in the `rsd_cpu` struct and compiled code calls back into the
-interpreter's own routines for flags and memory, so the two engines cannot
-disagree about what an instruction *means*.
+interpreter's own routines for memory and for the less common flags, so the
+two engines share one definition of most of what an instruction *means*; the
+exception is described under flags below.
 
-`hash` is new, and is why: a shift, a multiply and a byte in memory, which is
-the shape of most real integer code and of which the first compiler could
-compile nothing. It ran at interpreter speed, 387ms, and now runs in 96ms.
-`thunk`, which is byte work around a `strlen` call, went from 1.35x to 1.81x
-over the interpreter.
+`hash` was added for the change that taught the compiler shifts, multiplies
+and bytes: that is the shape of most real integer code, and the first
+compiler could compile none of it. It ran at interpreter speed, 387ms.
 
 `RASHID_JIT_PROFILE=1` reports how much of the run was compiled and lists, by
 opcode, what the interpreter was still asked to do; that list is how the
@@ -574,19 +573,74 @@ cannot, here. A quotient of two floats cannot land within 2⁻⁵³ of a
 single-precision rounding boundary without landing exactly on it, and 200
 million random pairs agreed.
 
+#### Where the time went: flags
+
+The plan had been to keep guest registers in host registers next. Measuring
+first changed it. `sample` cannot walk a stack through compiled code, so the
+measurement was done by removal instead: taking out the flag routine for the
+two instructions in `int`'s loop whose flags are never read cut the run from
+125ms to 76ms. Each call cost about 4ns, and the loop made four of them — the
+flags were most of the time, and the loads and stores of guest registers in
+memory were not.
+
+Two changes followed, each measured on its own:
+
+```
+              before   flags only     flags
+              (calls)   when read   in line
+int           120.4m       89.1m     57.5m
+mem           221.5m      119.5m    118.0m
+hash          273.5m      166.6m    152.8m
+```
+
+(6 million iterations each, which is why these are larger than the table
+above.)
+
+- **Only the flags something reads.** A block is decoded completely before
+  any of it is emitted, then walked backwards: for each instruction, which
+  of the flags it writes does a later instruction read before something
+  overwrites them? Usually none — an add is followed by a `cmp` — and then
+  the flag code is skipped. Everything is live where a block ends, because
+  the next block or the interpreter may read anything. The analysis has to
+  know which flags an instruction is *certain* to write: `inc` and `dec`
+  leave CF, logical operations here leave AF, and a shift by `cl` writes
+  nothing when `cl` is zero, so it overwrites nothing.
+- **The rest in line.** What is still needed is computed from arm64's own
+  flags rather than through a call: the operation is repeated as `cmn`,
+  `cmp` or `tst` at the right width, CF, ZF, SF and OF are read off NZCV
+  (a borrow is arm64's carry *clear*), and PF and AF, which arm64 does not
+  have, come from three shifted `eor`s and from `a ^ b ^ r`. Conditions for
+  `jcc` and `setcc` are read straight from the flags word.
+
+The second change gives up something the compiler had kept until now: one
+definition of what an instruction means, shared with the interpreter. These
+flags now have two. The interpreter's is still the reference, -J compares
+them after every block, and eight new mutations — readers ignored by the
+analysis, `inc` taken as writing CF, a shift by `cl` taken as writing flags,
+a borrow taken as arm64's carry, parity inverted, the nibble carry from the
+wrong bit, 32-bit flags taken at 64, `le` without ZF — check that it would
+notice. Byte operations still go to the interpreter's routine, since arm64
+has no 8-bit flag-setting forms.
+
+One of the eight was reported missed on the first run, and the fault was in
+the mutation, not the test: a shift by `cl` has no immediate, so the edited
+condition still came out zero and nothing had changed. The script's check
+that a mutation *applied* only compares the text.
+
 #### What would move it further
 
-In order of what the profile says is left: guest registers held in host
-registers, which removes a load and a store per operand and is the largest
-remaining win; lazy flags, which removes the helper call from most
-arithmetic; 16-bit operands and the `0x66` prefix, which is a small
-remaining hole; and the SSE long tail. Each is a separate change, because
-each needs its own mutations.
+`mem` did not move with the second change, because what it has left is the
+call into the interpreter for every load and store, with its permission
+check; an inline path for the common case is the next step there. After
+that: going from one block to the next without returning to the dispatcher,
+guest registers in host registers, 16-bit operands and the `0x66` prefix,
+and the SSE long tail. Each is a separate change, because each needs its own
+mutations.
 
 #### Checking the checker
 
 A verifier that never fails proves nothing, so `make jit-mutations` breaks
-the compiler twenty-two ways on purpose — an index scale off by one,
+the compiler thirty ways on purpose — an index scale off by one,
 RIP-relative addresses measured from the wrong place, an inverted branch, a
 32-bit add done at 64 bits, a push that forgets to move `rsp`, a `cmp` that
 writes its result, `min` returning the wrong operand on NaN, the `le`
@@ -595,8 +649,8 @@ integer converted as 64-bit, `andnot` with its operands swapped, `sqrt` of
 the wrong register, a byte write that clears its register, `ah` read and
 written as `al`, `movsx` widened as `movzx`, a shift count left unmasked, a
 shift by zero done anyway, a shift taking its count from the wrong register,
-a 32-bit multiply done at 64 bits, `setcc` inverted — and requires `-J` to
-catch every one.
+a 32-bit multiply done at 64 bits, `setcc` inverted, and the eight flag
+mutations above — and requires `-J` to catch every one.
 
 Getting there turned up these, each a way a passing test was not evidence:
 

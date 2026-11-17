@@ -110,6 +110,7 @@ compare callback
 compare jit
 compare jitsse
 compare jitint
+compare jitlane
 
 echo
 echo "== Objective-C (message sends into native arm64 Foundation) =="
@@ -118,7 +119,7 @@ compare objcclass
 
 echo
 echo "== jit (every compiled block checked against the interpreter) =="
-for t in native varargs callback jit jitsse jitint objc objcclass; do
+for t in native varargs callback jit jitsse jitint jitlane objc objcclass; do
     [ -x "tests/$t.x86" ] || continue
     out=$("$BIN" -J -n 0 "tests/$t.x86" 2>&1 >/dev/null)
     blocks=$(printf '%s' "$out" | sed -n 's/.*jit: \([0-9]*\) blocks compiled.*/\1/p')

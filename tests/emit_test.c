@@ -131,6 +131,15 @@ int main(void) {
     check("bic v0.16b, v1.16b, v0.16b", a64_vop(VOP_BIC, 0, 1, 0));
     check("orr v0.16b, v0.16b, v1.16b", a64_vop(VOP_ORR, 0, 0, 1));
     check("eor v0.16b, v0.16b, v1.16b", a64_vop(VOP_EOR, 0, 0, 1));
+    check("and v8.8b, v9.8b, v10.8b",   a64_vop8(VOP_AND, 8, 9, 10));
+    check("bic v8.8b, v9.8b, v10.8b",   a64_vop8(VOP_BIC, 8, 9, 10));
+    check("orr v8.8b, v9.8b, v10.8b",   a64_vop8(VOP_ORR, 8, 9, 10));
+    check("eor v8.8b, v9.8b, v10.8b",   a64_vop8(VOP_EOR, 8, 9, 10));
+    check("fmov d8, d0",             a64_fmov_dd(8, 0));
+    check("str d16, [sp, #-16]!",    a64_push_d(16));
+    check("ldr d23, [sp], #16",      a64_pop_d(23));
+    check("fmov s1, s9",             a64_fmov_ss(1, 9));
+    check("mov v8.s[0], v0.s[0]",    a64_ins_s0(8, 0));
     check("b.hs .+12",               a64_bcond(A64_CS, 3));
     check("blr x9",                  a64_blr(9));
     check("ret",                     a64_ret());

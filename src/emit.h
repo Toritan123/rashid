@@ -247,6 +247,22 @@ enum { VOP_AND = 0x4E201C00, VOP_BIC = 0x4E601C00, VOP_ORR = 0x4EA01C00, VOP_EOR
 static inline uint32_t a64_vop(int op, int d, int n, int m) {
     return (uint32_t)op | ((uint32_t)m << 16) | ((uint32_t)n << 5) | (uint32_t)d;
 }
+// The same on the low 64 bits only (Vd.8b), which is a scalar double's lane.
+static inline uint32_t a64_vop8(int op, int d, int n, int m) {
+    return a64_vop(op, d, n, m) & ~0x40000000u;
+}
+
+// str Dt, [sp, #-16]!   and   ldr Dt, [sp], #16 - one register kept across
+// a call, with sp staying 16-aligned
+static inline uint32_t a64_push_d(int t) { return 0xFC1F0FE0u | (uint32_t)t; }
+static inline uint32_t a64_pop_d(int t)  { return 0xFC4107E0u | (uint32_t)t; }
+
+// fmov Dd, Dn   and   fmov Sd, Sn
+static inline uint32_t a64_fmov_dd(int d, int n) { return 0x1E604000u | ((uint32_t)n << 5) | (uint32_t)d; }
+static inline uint32_t a64_fmov_ss(int d, int n) { return 0x1E204000u | ((uint32_t)n << 5) | (uint32_t)d; }
+
+// mov Vd.s[0], Vn.s[0] - a single's lane replaced, the rest of Vd kept
+static inline uint32_t a64_ins_s0(int d, int n) { return 0x6E040400u | ((uint32_t)n << 5) | (uint32_t)d; }
 // Guest XMM lanes live in rsd_cpu, so these load and store them directly.
 
 // ldr/str Dt, [Xn, #off]   (off multiple of 8)   and   St / Wt (multiple of 4)

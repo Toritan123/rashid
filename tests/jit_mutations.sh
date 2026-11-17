@@ -11,7 +11,7 @@ set -u
 cd "$(dirname "$0")/.."
 SRCS=(src/jit.c src/as.c)
 # A mutation counts as caught if -J objects on any of these.
-GUESTS=("tests/jit.x86" "tests/jitsse.x86" "tests/jitint.x86" "tests/bench.x86 flt 2000"
+GUESTS=("tests/jit.x86" "tests/jitsse.x86" "tests/jitint.x86" "tests/jitlane.x86" "tests/bench.x86 flt 2000"
         "tests/jitmem.x86 e" "tests/jitmem.x86 s" "tests/jitmem.x86 p")
 for g in "${GUESTS[@]}"; do
     f=${g%% *}
@@ -158,6 +158,21 @@ mutate "chained branch skips the push" \
   's{words\[b\.exits\[i\]\.slot\] = a64_b\(\(int32_t\)\(\(uint32_t \*\)to - slot\)\);}{words[b.exits[i].slot] = a64_b((int32_t)((uint32_t *)to - slot) + 1);}'
 mutate "waiting exits patched to the wrong block" \
   's{if \(j->pending\[i\]\.target != rip\) \{ i\+\+; continue; \}}{if (j->pending[i].target == rip) { i++; continue; }}'
+# XMM lanes kept in d8..d15
+mutate "kept lane not updated by a result" \
+  's{    if \(dbl\)            put\(b, a64_fmov_dd\(xc_alloc\(b, x\), d\)\);\n}{}'
+mutate "kept lane survives a load from memory" \
+  's{if \(!store\) xc_forget\(b, o->xreg\);}{}'
+mutate "kept andnot from swapped operands" \
+  's{a64_vop8\(VOP_BIC, cd, cs, cd\)}{a64_vop8(VOP_BIC, cd, cd, cs)}'
+mutate "eviction keeps the old mapping" \
+  's{        b->xc\[b->xowner\[k\] - 1\] = 0;\n}{}'
+mutate "single result replaces the whole lane" \
+  's{else if \(b->xc\[x\]\)  put\(b, a64_ins_s0\(xc_reg\(b, x\), d\)\);}{else if (b->xc[x])  put(b, a64_fmov_dd(xc_reg(b, x), d));}'
+mutate "copy leaves the destination's lane" \
+  's{    if \(c < 0\) \{ xc_forget\(b, to\); return; \}}{    if (c < 0) return;}'
+mutate "kept lanes not saved across a call" \
+  's{    for \(int k = 0; k < 8; k\+\+\) if \(b->xowner\[k\]\) put\(b, a64_push_d\(XC_BASE \+ k\)\);\n}{}; s{    for \(int k = 7; k >= 0; k--\) if \(b->xowner\[k\]\) put\(b, a64_pop_d\(XC_BASE \+ k\)\);\n}{}'
 mutate "setcc inverted" \
   's{o->cc = op2 & 0xF;}{o->cc = (op2 & 0xF) ^ 1;}'
 

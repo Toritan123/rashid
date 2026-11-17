@@ -475,11 +475,11 @@ same and replays every block through the interpreter before believing it.
 
 ```
 work      native   interp      jit  jit/interp  jit vs native
-int        12.3m   183.2m    16.9m      10.85x            1.4x
-mem        11.6m   321.2m    14.2m      22.57x            1.2x
-flt        19.7m   368.5m    42.8m       8.60x            2.2x
-hash       14.6m   465.3m    35.9m      12.96x            2.5x
-thunk      15.1m   111.4m    41.8m       2.66x            2.8x
+int        13.2m   190.6m    17.4m       10.92x            1.3x
+mem        12.0m   332.1m    14.8m       22.44x            1.2x
+flt        20.5m   382.9m    32.0m       11.95x            1.6x
+hash       15.1m   481.9m    37.7m       12.79x            2.5x
+thunk      16.0m   114.5m    43.3m        2.65x            2.7x
 ```
 
 It compiles 8-, 32- and 64-bit integer operations with register, immediate
@@ -753,17 +753,56 @@ version of the budget check accepted a budget fault raised after the loop
 had run to completion; it now requires the count it stopped at to be near
 the budget.
 
+#### XMM lanes in host registers
+
+Within a block, the low 64 bits of recently used XMM registers are now also
+kept in eight host vector registers. Memory is still written every time — the
+registers only spare the reads — so helpers, faults, the end of a block and
+-J all see `rsd_cpu` as before. What must not happen is a change to an XMM
+register that leaves the kept copy stale, so every write either updates the
+copy or forgets it: a 128-bit load from memory forgets, a copy copies, a
+bitwise operation recomputes the low lane from the kept operands, and a
+single-precision result replaces only the low 32 bits of a kept double.
+
+```
+              chained     lanes kept
+flt           118.5m        83.1m
+thunk         151.3m       153.0m
+```
+
+`flt`, 14% slower after chaining, is now 18% faster than before it.
+
+The first version kept the lanes in d8..d15, because calls preserve those,
+and saved them in the entry stub for its caller. That made `thunk` 4% slower:
+its loop leaves compiled code for an import stub every iteration, and paid
+eight more loads and stores each time it came back. They are now kept in
+v16..v23, which calls do not preserve, and saved around a call only when
+some are in use. Calls are the slower paths, so the common path pays nothing.
+
+That left a risk the tests could not see. The helpers happen not to use
+v16..v23, so a call that forgot to save them would work by luck — the
+mutation that removed the saves was not caught. Under -J the compiler now
+overwrites all eight after every call, as a helper would be entitled to,
+before restoring the ones it saved, and the mutation is caught.
+
+The existing tests also missed four of the six other ways this could go
+wrong — a 128-bit load leaving a stale copy, `andnpd` computed from swapped
+kept operands, a register given up with its mapping left behind, and a
+single result overwriting a whole kept double — because none of their
+blocks did those things. `tests/jitlane.c` does each of them in a single
+`asm` statement, against the hardware.
+
 #### What would move it further
 
-XMM values in host registers within a block, which `flt` needs most; then
-general registers likewise, `ret` through a return-address cache, 16-bit
-operands and the `0x66` prefix, and the SSE long tail. Each is a separate
-change, because each needs its own mutations.
+General registers in host registers too, `ret` through a return-address
+cache, keeping XMM lanes across chained blocks rather than reloading them in
+each, 16-bit operands and the `0x66` prefix, and the SSE long tail. Each is a
+separate change, because each needs its own mutations.
 
 #### Checking the checker
 
 A verifier that never fails proves nothing, so `make jit-mutations` breaks
-the compiler forty ways on purpose — an index scale off by one,
+the compiler forty-seven ways on purpose — an index scale off by one,
 RIP-relative addresses measured from the wrong place, an inverted branch, a
 32-bit add done at 64 bits, a push that forgets to move `rsp`, a `cmp` that
 writes its result, `min` returning the wrong operand on NaN, the `le`
@@ -778,7 +817,8 @@ inclusive, a region kept after `mprotect`, an in-line store not logged, a
 32-bit in-line load or store made at 64 bits — and four for chaining: the
 limit ignored, a block that counts one instruction too many, a chained
 branch that skips the target's prologue, waiting exits sent to the wrong
-block — and requires `-J` to catch
+block — and seven for kept XMM lanes, described above — and requires `-J` to
+catch
 every one.
 
 Getting there turned up these, each a way a passing test was not evidence:

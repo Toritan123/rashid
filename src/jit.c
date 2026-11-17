@@ -63,6 +63,11 @@ typedef struct {
     // there once it exists.
     struct { int slot; uint64_t target; } exits[4];
     int       nexit;
+    // Which XMM registers' low lanes are also in v16..v23: xc[guest] is the
+    // host register's index plus one, xowner[host] the guest's plus one,
+    // and zero means none. See the SSE section.
+    int8_t    xc[16], xowner[8];
+    int       xnext;
 } buf;
 
 static void put(buf *b, uint32_t insn) {
@@ -77,9 +82,23 @@ static void put_imm(buf *b, int reg, uint64_t v) {
     if (v >> 48)  put(b, a64_movk(reg, (uint16_t)(v >> 48), 3));
 }
 
+// XMM lanes kept in host registers (see the SSE section) live in v16..v23,
+// which a call does not preserve, so the ones in use are saved around it.
+// Calls are the slower paths - a load outside the remembered regions, a
+// byte operation's flags - and the paths without them pay nothing.
+#define XC_BASE 16             // v16: the first register lanes are kept in
+
+//
+// The helpers happen not to use those registers, so forgetting to save them
+// would go unnoticed. Under -J they are therefore overwritten after every
+// call, as a helper would be entitled to, before the saved ones come back.
 static void put_call(buf *b, void *fn) {
+    for (int k = 0; k < 8; k++) if (b->xowner[k]) put(b, a64_push_d(XC_BASE + k));
     put_imm(b, A64_X9, (uint64_t)(uintptr_t)fn);
     put(b, a64_blr(A64_X9));
+    if (b->check)
+        for (int k = 0; k < 8; k++) put(b, a64_fmov_dx(XC_BASE + k, A64_X9));
+    for (int k = 7; k >= 0; k--) if (b->xowner[k]) put(b, a64_pop_d(XC_BASE + k));
 }
 
 // Offsets into rsd_cpu, checked once in rsd_jit_init.
@@ -778,10 +797,81 @@ static void put_store(buf *b, int size) {       // x1 = address, x2 = value
 // d1/s1 the source while an instruction is computed. Helper calls clobber
 // every low FP register, so a memory source is fetched before the
 // destination is loaded.
+//
+// Within a block, the low 64 bits of recently used XMM registers are also
+// kept in v16..v23. A floating-point value stored to memory and loaded back
+// costs about 8 cycles on this hardware, where a general register's costs
+// almost nothing, and a loop like flt's was a chain of a dozen of those.
+// Memory is still written every time - the registers only spare the reads -
+// so a helper, a fault, the end of a block and -J all see rsd_cpu exactly as
+// before. put_call saves the ones in use around calls. What must not happen
+// is a write to an XMM register in memory that leaves its copy here stale,
+// so every such write below either updates the copy or forgets it.
 
 #define D0 0
 #define D1 1
 #define D2 2
+
+static int xc_reg(const buf *b, int x) {
+    return b->xc[x] ? XC_BASE - 1 + b->xc[x] : -1;
+}
+
+static void xc_forget(buf *b, int x) {
+    if (b->xc[x]) { b->xowner[b->xc[x] - 1] = 0; b->xc[x] = 0; }
+}
+
+// A register to keep guest x's lane in, taking one from another guest
+// register if all are in use. Memory is current, so that one is simply
+// read from memory next time.
+static int xc_alloc(buf *b, int x) {
+    if (b->xc[x]) return XC_BASE - 1 + b->xc[x];
+    int k = -1;
+    for (int i = 0; i < 8; i++) if (!b->xowner[i]) { k = i; break; }
+    if (k < 0) {
+        k = b->xnext;
+        b->xnext = (b->xnext + 1) & 7;
+        b->xc[b->xowner[k] - 1] = 0;
+    }
+    b->xowner[k] = (int8_t)(x + 1);
+    b->xc[x] = (int8_t)(k + 1);
+    return XC_BASE + k;
+}
+
+// Guest x's low lane into d (or its low 32 bits into s).
+static void xc_get(buf *b, int x, int d, bool dbl) {
+    int c = xc_reg(b, x);
+    if (c >= 0) { put(b, dbl ? a64_fmov_dd(d, c) : a64_fmov_ss(d, c)); return; }
+    put(b, a64_ldr_d(d, CPU, off_xmm(x)));        // all 64 bits, so they can be kept
+    put(b, a64_fmov_dd(xc_alloc(b, x), d));
+}
+
+// A new low lane for guest x, in d: a double replaces all 64 bits, a single
+// only the low 32.
+static void xc_set(buf *b, int x, int d, bool dbl) {
+    put(b, dbl ? a64_str_d(d, CPU, off_xmm(x)) : a64_str_s(d, CPU, off_xmm(x)));
+    if (dbl)            put(b, a64_fmov_dd(xc_alloc(b, x), d));
+    else if (b->xc[x])  put(b, a64_ins_s0(xc_reg(b, x), d));
+}
+
+// Guest x's low 64 bits were just stored from general register r.
+static void xc_set_gpr(buf *b, int x, int r) {
+    put(b, a64_fmov_dx(xc_alloc(b, x), r));
+}
+
+// Guest x's low lane, as raw bits, into general register r.
+static void xc_get_gpr(buf *b, int x, int r, bool d64) {
+    int c = xc_reg(b, x);
+    if (c >= 0) put(b, d64 ? a64_fmov_xd(r, c) : a64_fmov_ws(r, c));
+    else        put(b, d64 ? a64_ldr(r, CPU, off_xmm(x)) : a64_ldr_w(r, CPU, off_xmm(x)));
+}
+
+// After a copy of guest from's low 64 bits or more to guest to.
+static void xc_copy(buf *b, int to, int from) {
+    if (to == from) return;
+    int c = xc_reg(b, from);
+    if (c < 0) { xc_forget(b, to); return; }
+    put(b, a64_fmov_dd(xc_alloc(b, to), c));
+}
 
 // Which AArch64 condition gives each CMPSD/CMPSS predicate after fcmp. An
 // unordered comparison sets C and V, which is what makes these line up.
@@ -797,10 +887,7 @@ static const int cmp_cond[8] = {
 };
 
 static void put_fsrc(buf *b, const insn *o, uint64_t rip, bool dbl) {
-    if (!o->mem) {
-        put(b, dbl ? a64_ldr_d(D1, CPU, off_xmm(o->xsrc)) : a64_ldr_s(D1, CPU, off_xmm(o->xsrc)));
-        return;
-    }
+    if (!o->mem) { xc_get(b, o->xsrc, D1, dbl); return; }
     put_set_rip(b, rip);
     put_ea(b, o);
     put_load(b, dbl ? 8 : 4);
@@ -819,34 +906,38 @@ static void put_sse(buf *b, const insn *o, uint64_t rip) {
             bool store = (o->op2 == 0x11);
             if (!o->mem) {
                 // Register to register replaces only the low lane.
-                uint32_t from = store ? dst : off_xmm(o->xsrc);
-                uint32_t to   = store ? off_xmm(o->xsrc) : dst;
+                int fx = store ? o->xreg : o->xsrc, tx = store ? o->xsrc : o->xreg;
+                uint32_t from = off_xmm(fx), to = off_xmm(tx);
                 if (nb == 8) { put(b, a64_ldr(A64_X1, CPU, from)); put(b, a64_str(A64_X1, CPU, to)); }
                 else         { put(b, a64_ldr_w(A64_X1, CPU, from)); put(b, a64_str_w(A64_X1, CPU, to)); }
+                if (nb == 8) xc_copy(b, tx, fx);
+                else         xc_forget(b, tx);
                 return;
             }
             put_set_rip(b, rip);
             put_ea(b, o);
             if (store) {
-                put(b, a64_ldr(A64_X2, CPU, dst));
+                xc_get_gpr(b, o->xreg, A64_X2, true);
                 put_store(b, nb);
                 return;
             }
             put_load(b, nb);                            // from memory: rest zeroed
             put(b, a64_str(A64_X0, CPU, dst));
             put(b, a64_str(A64_ZR, CPU, dst + 8));
+            xc_set_gpr(b, o->xreg, A64_X0);
             return;
         }
         /* fall through: movups / movupd */
     case 0x28: case 0x29: {                             // 128-bit copies
         bool store = (o->op2 & 1);
         if (!o->mem) {
-            uint32_t from = store ? dst : off_xmm(o->xsrc);
-            uint32_t to   = store ? off_xmm(o->xsrc) : dst;
+            int fx = store ? o->xreg : o->xsrc, tx = store ? o->xsrc : o->xreg;
+            uint32_t from = off_xmm(fx), to = off_xmm(tx);
             put(b, a64_ldr(A64_X1, CPU, from));
             put(b, a64_ldr(A64_X2, CPU, from + 8));
             put(b, a64_str(A64_X1, CPU, to));
             put(b, a64_str(A64_X2, CPU, to + 8));
+            xc_copy(b, tx, fx);
             return;
         }
         put_set_rip(b, rip);
@@ -855,6 +946,7 @@ static void put_sse(buf *b, const insn *o, uint64_t rip) {
         put(b, a64_mov(A64_X0, CPU));
         put_call(b, store ? (void *)rsd_i_st128 : (void *)rsd_i_ld128);
         put_fault_check(b);
+        if (!store) xc_forget(b, o->xreg);              // written behind our back
         return;
     }
 
@@ -875,14 +967,30 @@ static void put_sse(buf *b, const insn *o, uint64_t rip) {
         }
         put(b, a64_ldr(A64_X1, CPU, dst));
         put(b, a64_ldr(A64_X2, CPU, dst + 8));
+        int vop;
         switch (o->op2) {
-        case 0x54: case 0xDB: put(b, a64_and(A64_X1, A64_X1, A64_X4)); put(b, a64_and(A64_X2, A64_X2, A64_X5)); break;
-        case 0x55:            put(b, a64_bic(A64_X1, A64_X4, A64_X1)); put(b, a64_bic(A64_X2, A64_X5, A64_X2)); break;
-        case 0x56: case 0xEB: put(b, a64_orr(A64_X1, A64_X1, A64_X4)); put(b, a64_orr(A64_X2, A64_X2, A64_X5)); break;
-        default:              put(b, a64_eor(A64_X1, A64_X1, A64_X4)); put(b, a64_eor(A64_X2, A64_X2, A64_X5)); break;
+        case 0x54: case 0xDB: vop = VOP_AND;
+                   put(b, a64_and(A64_X1, A64_X1, A64_X4)); put(b, a64_and(A64_X2, A64_X2, A64_X5)); break;
+        case 0x55: vop = VOP_BIC;
+                   put(b, a64_bic(A64_X1, A64_X4, A64_X1)); put(b, a64_bic(A64_X2, A64_X5, A64_X2)); break;
+        case 0x56: case 0xEB: vop = VOP_ORR;
+                   put(b, a64_orr(A64_X1, A64_X1, A64_X4)); put(b, a64_orr(A64_X2, A64_X2, A64_X5)); break;
+        default:   vop = VOP_EOR;
+                   put(b, a64_eor(A64_X1, A64_X1, A64_X4)); put(b, a64_eor(A64_X2, A64_X2, A64_X5)); break;
         }
         put(b, a64_str(A64_X1, CPU, dst));
         put(b, a64_str(A64_X2, CPU, dst + 8));
+        // Both lanes go to memory through general registers. The low lane
+        // is computed again where it is kept, from the kept copies, so that
+        // what reads it next need not wait for memory: the general-register
+        // result was read from memory, and those reads are the wait.
+        int cd = xc_reg(b, o->xreg), cs = o->mem ? -1 : xc_reg(b, o->xsrc);
+        if (cd >= 0 && cs >= 0) {
+            if (vop == VOP_BIC) put(b, a64_vop8(VOP_BIC, cd, cs, cd));   // ~dst & src
+            else                put(b, a64_vop8(vop, cd, cd, cs));
+        } else {
+            xc_set_gpr(b, o->xreg, A64_X1);
+        }
         return;
     }
 
@@ -890,8 +998,8 @@ static void put_sse(buf *b, const insn *o, uint64_t rip) {
     case 0x5D: case 0x5E: case 0x5F: {                  // scalar arithmetic
         put_fsrc(b, o, rip, dbl);
         if (o->op2 != 0x51) {
-            put(b, dbl ? a64_ldr_d(D0, CPU, dst) : a64_ldr_s(D0, CPU, dst));
-            put(b, dbl ? a64_ldr_d(D2, CPU, dst) : a64_ldr_s(D2, CPU, dst));  // first operand, kept
+            xc_get(b, o->xreg, D0, dbl);
+            put(b, dbl ? a64_fmov_dd(D2, D0) : a64_fmov_ss(D2, D0));      // first operand, kept
         }
         switch (o->op2) {
         case 0x58: put(b, dbl ? a64_fop_d(FOP_ADD, D0, D0, D1) : a64_fop_s(FOP_ADD, D0, D0, D1)); break;
@@ -930,16 +1038,23 @@ static void put_sse(buf *b, const insn *o, uint64_t rip) {
             put(b, dbl ? a64_fmov_dx(D0, A64_X0) : a64_fmov_sw(D0, A64_X0));
             if (!b->full) b->out[skip] = a64_bcond(A64_VC, b->n - skip);
         }
-        put(b, dbl ? a64_str_d(D0, CPU, dst) : a64_str_s(D0, CPU, dst));
+        xc_set(b, o->xreg, D0, dbl);
         return;
     }
 
     case 0xC2:                                          // cmpsd / cmpss
         put_fsrc(b, o, rip, dbl);
-        put(b, dbl ? a64_ldr_d(D0, CPU, dst) : a64_ldr_s(D0, CPU, dst));
+        xc_get(b, o->xreg, D0, dbl);
         put(b, dbl ? a64_fcmp_d(D0, D1) : a64_fcmp_s(D0, D1));
-        if (dbl) { put(b, a64_csetm(A64_X3, cmp_cond[o->pred]));   put(b, a64_str(A64_X3, CPU, dst)); }
-        else     { put(b, a64_csetm_w(A64_X3, cmp_cond[o->pred])); put(b, a64_str_w(A64_X3, CPU, dst)); }
+        if (dbl) {
+            put(b, a64_csetm(A64_X3, cmp_cond[o->pred]));
+            put(b, a64_str(A64_X3, CPU, dst));
+            xc_set_gpr(b, o->xreg, A64_X3);
+        } else {
+            put(b, a64_csetm_w(A64_X3, cmp_cond[o->pred]));
+            put(b, a64_str_w(A64_X3, CPU, dst));
+            xc_forget(b, o->xreg);
+        }
         return;
 
     case 0x2E: case 0x2F: {                             // ucomis / comis
@@ -950,9 +1065,9 @@ static void put_sse(buf *b, const insn *o, uint64_t rip) {
             put_load(b, d64 ? 8 : 4);
             put(b, a64_mov(A64_X2, A64_X0));
         } else {
-            put(b, d64 ? a64_ldr(A64_X2, CPU, off_xmm(o->xsrc)) : a64_ldr_w(A64_X2, CPU, off_xmm(o->xsrc)));
+            xc_get_gpr(b, o->xsrc, A64_X2, d64);
         }
-        put(b, d64 ? a64_ldr(A64_X1, CPU, dst) : a64_ldr_w(A64_X1, CPU, dst));
+        xc_get_gpr(b, o->xreg, A64_X1, d64);
         put(b, a64_mov(A64_X0, CPU));
         put_call(b, d64 ? (void *)rsd_i_comisd : (void *)rsd_i_comiss);
         return;
@@ -970,7 +1085,7 @@ static void put_sse(buf *b, const insn *o, uint64_t rip) {
         }
         if (dbl) put(b, o->isize == 8 ? a64_scvtf_dx(D0, A64_X1) : a64_scvtf_dw(D0, A64_X1));
         else     put(b, o->isize == 8 ? a64_scvtf_sx(D0, A64_X1) : a64_scvtf_sw(D0, A64_X1));
-        put(b, dbl ? a64_str_d(D0, CPU, dst) : a64_str_s(D0, CPU, dst));
+        xc_set(b, o->xreg, D0, dbl);
         return;
     }
 
@@ -984,7 +1099,7 @@ static void put_sse(buf *b, const insn *o, uint64_t rip) {
             put_load(b, fsize);
             put(b, a64_mov(A64_X1, A64_X0));
         } else {
-            put(b, a64_ldr(A64_X1, CPU, off_xmm(o->xsrc)));
+            xc_get_gpr(b, o->xsrc, A64_X1, true);
         }
         put(b, a64_mov(A64_X0, CPU));
         put_imm(b, A64_X2, (uint64_t)fsize);
@@ -999,11 +1114,11 @@ static void put_sse(buf *b, const insn *o, uint64_t rip) {
         if (dbl) {                                      // double -> single
             put_fsrc(b, o, rip, true);
             put(b, a64_fcvt_sd(D0, D1));
-            put(b, a64_str_s(D0, CPU, dst));
+            xc_set(b, o->xreg, D0, false);
         } else {                                        // single -> double
             put_fsrc(b, o, rip, false);
             put(b, a64_fcvt_ds(D0, D1));
-            put(b, a64_str_d(D0, CPU, dst));
+            xc_set(b, o->xreg, D0, true);
         }
         return;
     }

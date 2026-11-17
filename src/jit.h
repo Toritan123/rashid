@@ -27,6 +27,10 @@
 //
 // Anything not understood simply ends the block, and the interpreter takes
 // over from there, so the compiler can stay small and grow by measurement.
+//
+// Blocks count their own instructions and branch straight into the next
+// block where the address is known, so a loop may run for a long time
+// without coming back; rsd_cpu.jit_limit is what stops it.
 #ifndef RASHID_JIT_H
 #define RASHID_JIT_H
 
@@ -48,7 +52,11 @@ typedef struct rsd_jit {
         uint32_t pad;
     } *cache;
     int      cache_bits;
-    uint64_t compiled, executed, bailed, interp;
+    uint64_t compiled, executed, bailed, interp, chained;
+    // Exits waiting for their target to be compiled, so they can be pointed
+    // at it then.
+    struct rsd_jit_pending { uint64_t target; uint32_t *slot; } *pending;
+    int      npending, cap_pending;
     // What the interpreter was asked to run, by opcode. The next thing
     // worth compiling is whatever is at the top of this list.
     struct rsd_jit_prof { uint8_t b[4]; uint64_t n; } *prof;
@@ -61,7 +69,6 @@ void rsd_jit_free(rsd_jit *j);
 // Compiled entry point for this address, compiling it if worthwhile, or NULL
 // if there is nothing here the compiler understands.
 void *rsd_jit_lookup(rsd_jit *j, rsd_cpu *c, uint64_t rip);
-uint32_t rsd_jit_count(const rsd_jit *j, uint64_t rip);
 
 // One guest instruction the compiler declined, counted and - with
 // RASHID_JIT_PROFILE set - recorded by its first four bytes.

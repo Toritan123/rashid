@@ -1782,10 +1782,11 @@ static void undo_writes(const struct rsd_writelog *w) {
         memcpy((void *)(uintptr_t)w->e[i].addr, w->e[i].before, (size_t)w->e[i].span);
 }
 
-static bool run_block(rsd_cpu *c, void *body, uint32_t ninsn) {
+// Compiled code counts its own instructions and may chain through several
+// blocks before it returns, so what is replayed is however many it ran.
+static bool run_block(rsd_cpu *c, void *body) {
     if (!c->jit_check) {
         c->rip = rsd_jit_enter(c, body);
-        c->icount += ninsn;
         return true;
     }
 
@@ -1797,6 +1798,7 @@ static bool run_block(rsd_cpu *c, void *body, uint32_t ninsn) {
     c->rip = rsd_jit_enter(c, body);
     c->wlog = NULL;
     rsd_cpu after = *c;
+    uint64_t ninsn = after.icount - before.icount;
     for (int i = 0; !jit_log.overflow && i < jit_log.n; i++)
         memcpy(jit_log.e[i].after, (void *)(uintptr_t)jit_log.e[i].addr,
                (size_t)jit_log.e[i].span);
@@ -1879,15 +1881,22 @@ static bool run_block(rsd_cpu *c, void *body, uint32_t ninsn) {
 }
 
 
+// Under -J a chained run is replayed and compared as a whole, so it is kept
+// short enough for the write log to hold it.
+#define CHECK_CHAIN 128
+
 void rsd_cpu_run(rsd_cpu *c, uint64_t budget) {
     g_cpu = c;
+    uint64_t limit = budget ? budget : UINT64_MAX;
+    c->jit_limit = limit;
     while (c->running) {
         if (c->jit && !c->trace) {
             void *body = rsd_jit_lookup(c->jit, c, c->rip);
             if (body) {
-                uint32_t n = rsd_jit_count(c->jit, c->rip);
                 c->jit->executed++;
-                if (!run_block(c, body, n)) break;
+                if (c->jit_check)
+                    c->jit_limit = c->icount + CHECK_CHAIN < limit ? c->icount + CHECK_CHAIN : limit;
+                if (!run_block(c, body)) break;
                 if (budget && c->icount >= budget) {
                     c->fault = "instruction budget exhausted";
                     c->fault_rip = c->rip;

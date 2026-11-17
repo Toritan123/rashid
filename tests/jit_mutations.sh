@@ -35,6 +35,16 @@ check() {   # prints "agree", "disagree" or "crashed"
         # legitimately exit with 255.
         printf '%s' "$out" | grep -q "rashid: host SIG" && crashed=yes
     done
+    # An instruction budget has to stop a loop that never goes back to the
+    # dispatcher. -J cannot see this one: it replays however many
+    # instructions compiled code says it ran.
+    # Stopping only after the loop has finished would not do, so the count it
+    # stopped at has to be close to the budget.
+    out=$(./rashid -j -n 100000 tests/bench.x86 int 10000000 2>&1 >/dev/null)
+    n=$(printf '%s' "$out" | sed -n 's/.*guest state (\([0-9]*\) instructions).*/\1/p')
+    if ! printf '%s' "$out" | grep -q "budget exhausted" || [ "${n:-0}" -gt 101000 ]; then
+        echo disagree; return
+    fi
     [ $crashed = yes ] && echo crashed || echo agree
 }
 
@@ -68,7 +78,7 @@ mutate "index scale off by one" \
 mutate "rip-relative measured from start" \
   's{put_imm\(b, A64_X1, o->next \+ \(uint64_t\)o->disp\)}{put_imm(b, A64_X1, o->next - 4 + (uint64_t)o->disp)}'
 mutate "conditional branch inverted" \
-  's{a64_csel\(A64_X0, A64_X2, A64_X3, \(o->cc & 1\) \? A64_EQ : A64_NE\)}{a64_csel(A64_X0, A64_X2, A64_X3, (o->cc & 1) ? A64_NE : A64_EQ)}'
+  's{\(o->cc & 1\) \? A64_EQ : A64_NE\)(.*?)\(o->cc & 1\) \? A64_EQ : A64_NE\)}{(o->cc & 1) ? A64_NE : A64_EQ)$1(o->cc & 1) ? A64_NE : A64_EQ)}s'
 mutate "32-bit add done at 64 bits" \
   's{w \? a64_add_w\(A64_X3, A64_X1, A64_X2\) : a64_add}{w ? a64_add(A64_X3, A64_X1, A64_X2) : a64_add}'
 mutate "push forgets to move rsp" \
@@ -139,6 +149,15 @@ mutate "in-line 32-bit load takes 64" \
   's{case 4:  put\(b, a64_ldr_w\(A64_X0, A64_X1, 0\)\);}{case 4:  put(b, a64_ldr(A64_X0, A64_X1, 0));}'
 mutate "in-line 32-bit store writes 64" \
   's{case 4:  put\(b, a64_str_w\(A64_X2, A64_X1, 0\)\);}{case 4:  put(b, a64_str(A64_X2, A64_X1, 0));}'
+# chaining blocks
+mutate "chained exit ignores the limit" \
+  's{if \(!b->full\) b->out\[over\] = a64_bcond\(A64_CS, b->n - over\);}{if (!b->full) b->out[over] = A64_NOP;}'
+mutate "block counts one too many" \
+  's{a64_add_imm\(A64_X9, A64_X9, \(uint32_t\)count\)}{a64_add_imm(A64_X9, A64_X9, (uint32_t)count + 1)}'
+mutate "chained branch skips the push" \
+  's{words\[b\.exits\[i\]\.slot\] = a64_b\(\(int32_t\)\(\(uint32_t \*\)to - slot\)\);}{words[b.exits[i].slot] = a64_b((int32_t)((uint32_t *)to - slot) + 1);}'
+mutate "waiting exits patched to the wrong block" \
+  's{if \(j->pending\[i\]\.target != rip\) \{ i\+\+; continue; \}}{if (j->pending[i].target == rip) { i++; continue; }}'
 mutate "setcc inverted" \
   's{o->cc = op2 & 0xF;}{o->cc = (op2 & 0xF) ^ 1;}'
 

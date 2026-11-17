@@ -125,7 +125,13 @@ int main(int argc, char **argv) {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = on_crash;
-    sa.sa_flags = SA_SIGINFO;
+    // On a stack of its own: a crash in compiled code can leave sp anywhere,
+    // and a handler that needs the broken stack is never run, so rashid
+    // died without saying where.
+    static uint8_t altstack[64 * 1024];
+    stack_t ss = { .ss_sp = altstack, .ss_size = sizeof altstack, .ss_flags = 0 };
+    sigaltstack(&ss, NULL);
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
     crash_cpu = &cpu;

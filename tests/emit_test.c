@@ -123,6 +123,14 @@ int main(void) {
     check("fcvt d0, s1",             a64_fcvt_ds(0, 1));
     check("b.vc .+36",               a64_bcond(A64_VC, 9));
     check("b .+36",                  a64_b(9));
+    check("b .-8",                   a64_b(-2));
+    check("nop",                     A64_NOP);
+    check("ldr q0, [x19, #208]",     a64_ldr_q(0, 19, 208));
+    check("str q1, [x9]",            a64_str_q(1, 9, 0));
+    check("and v0.16b, v0.16b, v1.16b", a64_vop(VOP_AND, 0, 0, 1));
+    check("bic v0.16b, v1.16b, v0.16b", a64_vop(VOP_BIC, 0, 1, 0));
+    check("orr v0.16b, v0.16b, v1.16b", a64_vop(VOP_ORR, 0, 0, 1));
+    check("eor v0.16b, v0.16b, v1.16b", a64_vop(VOP_EOR, 0, 0, 1));
     check("b.hs .+12",               a64_bcond(A64_CS, 3));
     check("blr x9",                  a64_blr(9));
     check("ret",                     a64_ret());

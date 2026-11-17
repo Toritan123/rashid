@@ -59,6 +59,10 @@ typedef struct {
     bool      check;           // -J: in-line stores must be logged too
     int       fix[256];        // cbz words to point at the fault exit
     int       nfix;
+    // Exits to a known address, which can be pointed straight at the block
+    // there once it exists.
+    struct { int slot; uint64_t target; } exits[4];
+    int       nexit;
 } buf;
 
 static void put(buf *b, uint32_t insn) {
@@ -86,6 +90,8 @@ static uint32_t off_xmm(int i) { return (uint32_t)(offsetof(rsd_cpu, xmm) + (siz
 #define OFF_RUNNING ((uint32_t)offsetof(rsd_cpu, running))
 #define OFF_FLAGS   ((uint32_t)offsetof(rsd_cpu, flags))
 #define OFF_AS      ((uint32_t)offsetof(rsd_cpu, as))
+#define OFF_ICOUNT  ((uint32_t)offsetof(rsd_cpu, icount))
+#define OFF_LIMIT   ((uint32_t)offsetof(rsd_cpu, jit_limit))
 
 // Which instruction is executing, so a fault inside a helper is reported
 // against it rather than against wherever the block began.
@@ -106,6 +112,35 @@ static void put_fault_check(buf *b) {
 
 static void put_leave(buf *b) {
     put(b, a64_pop(A64_X30));
+    put(b, a64_ret());
+}
+
+// Leave for a known address. Going back to the dispatcher only to look up
+// the next block costs more than many small blocks do, so this exit has a
+// slot that starts as a nop - falling through to an ordinary return - and
+// becomes a branch straight into the next block once that is compiled.
+//
+// Each block counts its own instructions on entry, so the count is right
+// however blocks were reached, and an exit only chains while the count is
+// below jit_limit: that is how an instruction budget still stops a loop
+// that never returns to the dispatcher, and how -J keeps each run it checks
+// short.
+static void put_chain(buf *b, uint64_t target) {
+    put(b, a64_ldr(A64_X9, CPU, OFF_ICOUNT));
+    put(b, a64_ldr(A64_X10, CPU, OFF_LIMIT));
+    put(b, a64_pop(A64_X30));                   // the next block pushes its own
+    put(b, a64_subs_zr(A64_X9, A64_X10, false));
+    int over = b->n;
+    put(b, a64_bcond(A64_CS, 0));
+    if (b->nexit < 4) {
+        b->exits[b->nexit].slot = b->n;
+        b->exits[b->nexit++].target = target;
+    } else {
+        b->full = true;
+    }
+    put(b, A64_NOP);
+    if (!b->full) b->out[over] = a64_bcond(A64_CS, b->n - over);
+    put_imm(b, A64_X0, target);
     put(b, a64_ret());
 }
 
@@ -1151,17 +1186,18 @@ static void put_insn(buf *b, const insn *o, uint64_t rip) {
 
     // --- block terminators: x0 = where to continue ---------------------
     case K_JMP:
-        put_imm(b, A64_X0, o->target);
-        put_leave(b);
+        put_chain(b, o->target);
         return;
 
-    case K_JCC:
-        put_cond_even(b, o->cc);                // movz and movk leave nzcv alone
-        put_imm(b, A64_X2, o->target);
-        put_imm(b, A64_X3, o->next);
-        put(b, a64_csel(A64_X0, A64_X2, A64_X3, (o->cc & 1) ? A64_EQ : A64_NE));
-        put_leave(b);
+    case K_JCC: {
+        put_cond_even(b, o->cc);
+        int taken = b->n;
+        put(b, a64_bcond((o->cc & 1) ? A64_EQ : A64_NE, 0));
+        put_chain(b, o->next);
+        put_patch_bcond(b, taken, (o->cc & 1) ? A64_EQ : A64_NE);
+        put_chain(b, o->target);
         return;
+    }
 
     case K_CALL:
         put_set_rip(b, rip);
@@ -1170,8 +1206,7 @@ static void put_insn(buf *b, const insn *o, uint64_t rip) {
         put(b, a64_str(A64_X1, CPU, off_r(4)));
         put_imm(b, A64_X2, o->next);
         put_store(b, 8);
-        put_imm(b, A64_X0, o->target);
-        put_leave(b);
+        put_chain(b, o->target);
         return;
 
     case K_RET:
@@ -1221,6 +1256,7 @@ int rsd_jit_init(rsd_jit *j) {
     // Compiled code addresses rsd_cpu fields with scaled 12-bit offsets.
     if (off_r(15) >= 32768 || OFF_CURRIP % 8 || OFF_CURRIP >= 32768 ||
         off_tmp(7) >= 4096 || OFF_RUNNING >= 4096 || OFF_AS % 8 || OFF_AS >= 32768 ||
+        OFF_ICOUNT % 8 || OFF_ICOUNT >= 32768 || OFF_LIMIT % 8 || OFF_LIMIT >= 32768 ||
         OFF_FLAGS % 4 || OFF_FLAGS >= 16384 ||
         off_xmm(0) % 8 || off_xmm(15) + 8 >= 4096) {
         fprintf(stderr, "rashid: rsd_cpu layout is out of reach of the jit\n");
@@ -1237,6 +1273,7 @@ void rsd_jit_free(rsd_jit *j) {
     if (j->arena && j->arena != MAP_FAILED) munmap(j->arena, j->size);
     free(j->cache);
     free(j->prof);
+    free(j->pending);
     memset(j, 0, sizeof *j);
 }
 
@@ -1254,8 +1291,8 @@ void rsd_jit_note_interp(rsd_jit *j, const uint8_t *code) {
 void rsd_jit_report(const rsd_jit *j, uint64_t icount) {
     double pct = icount ? 100.0 * (double)(icount - j->interp) / (double)icount : 0;
     fprintf(stderr, "-- jit: %llu blocks compiled, %llu entered, %llu declined, "
-            "%.1f%% of instructions compiled --\n",
-            j->compiled, j->executed, j->bailed, pct);
+            "%llu exits chained, %.1f%% of instructions compiled --\n",
+            j->compiled, j->executed, j->bailed, j->chained, pct);
     if (!j->prof) return;
     // A copy, so reporting does not reorder what is still being collected.
     struct rsd_jit_prof *p = malloc((size_t)j->nprof * sizeof *p);
@@ -1276,9 +1313,20 @@ static size_t slot_of(const rsd_jit *j, uint64_t rip) {
     return (size_t)(h >> (64 - j->cache_bits));
 }
 
-uint32_t rsd_jit_count(const rsd_jit *j, uint64_t rip) {
+static void *compiled(const rsd_jit *j, uint64_t rip) {
     size_t s = slot_of(j, rip);
-    return j->cache[s].tag == rip ? j->cache[s].count : 0;
+    return j->cache[s].tag == rip ? j->cache[s].code : NULL;
+}
+
+static void add_pending(rsd_jit *j, uint64_t target, uint32_t *slot) {
+    if (j->npending == j->cap_pending) {
+        int cap = j->cap_pending ? j->cap_pending * 2 : 256;
+        struct rsd_jit_pending *p = realloc(j->pending, (size_t)cap * sizeof *p);
+        if (!p) return;                         // that exit just never chains
+        j->pending = p;
+        j->cap_pending = cap;
+    }
+    j->pending[j->npending++] = (struct rsd_jit_pending){ target, slot };
 }
 
 void *rsd_jit_lookup(rsd_jit *j, rsd_cpu *c, uint64_t rip) {
@@ -1318,6 +1366,9 @@ void *rsd_jit_lookup(rsd_jit *j, rsd_cpu *c, uint64_t rip) {
         flag_liveness(v, count);
         b = (buf){ .out = words, .n = 0, .max = MAX_BLOCK - 24, .check = c->jit_check };
         put(&b, a64_push(A64_X30));
+        put(&b, a64_ldr(A64_X9, CPU, OFF_ICOUNT));
+        put(&b, a64_add_imm(A64_X9, A64_X9, (uint32_t)count));
+        put(&b, a64_str(A64_X9, CPU, OFF_ICOUNT));
         int i = 0;
         uint64_t at = rip;
         for (; i < count; i++) {
@@ -1336,10 +1387,7 @@ void *rsd_jit_lookup(rsd_jit *j, rsd_cpu *c, uint64_t rip) {
     }
 
     b.max = MAX_BLOCK;
-    if (!ended) {                               // fell off the end: continue there
-        put_imm(&b, A64_X0, pc);
-        put_leave(&b);
-    }
+    if (!ended) put_chain(&b, pc);              // fell off the end: continue there
     int exit_at = b.n;                          // a helper faulted
     put(&b, a64_ldr(A64_X0, CPU, OFF_CURRIP));
     put_leave(&b);
@@ -1353,8 +1401,26 @@ void *rsd_jit_lookup(rsd_jit *j, rsd_cpu *c, uint64_t rip) {
     if (j->used + bytes > j->size) return NULL;
     void *code = j->arena + j->used;
 
+    // Exits whose target is already compiled - or is this block - branch to
+    // it now; the rest wait for it.
+    for (int i = 0; i < b.nexit; i++) {
+        uint32_t *slot = (uint32_t *)code + b.exits[i].slot;
+        void *to = b.exits[i].target == rip ? code : compiled(j, b.exits[i].target);
+        if (to) { words[b.exits[i].slot] = a64_b((int32_t)((uint32_t *)to - slot)); j->chained++; }
+        else    add_pending(j, b.exits[i].target, slot);
+    }
+
     pthread_jit_write_protect_np(0);
     memcpy(code, words, bytes);
+    // And exits that were waiting for this block can go to it now.
+    for (int i = 0; i < j->npending; ) {
+        if (j->pending[i].target != rip) { i++; continue; }
+        uint32_t *slot = j->pending[i].slot;
+        *slot = a64_b((int32_t)((uint32_t *)code - slot));
+        sys_icache_invalidate(slot, 4);
+        j->chained++;
+        j->pending[i] = j->pending[--j->npending];
+    }
     pthread_jit_write_protect_np(1);
     sys_icache_invalidate(code, bytes);
 

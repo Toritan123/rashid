@@ -77,6 +77,7 @@ typedef struct {
     struct rsd_jit *jit;  // compiled blocks, NULL when interpreting only
     bool     jit_check;   // run both engines and compare
     uint64_t jit_tmp[8];  // scratch that compiled code keeps across calls
+    uint64_t jit_limit;   // compiled code chains blocks only while icount is below this
     struct rsd_writelog *wlog; // records guest memory writes while checking
 
     rsd_as  *as;          // guest address space

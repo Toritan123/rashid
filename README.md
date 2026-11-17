@@ -475,11 +475,11 @@ same and replays every block through the interpreter before believing it.
 
 ```
 work      native   interp      jit  jit/interp  jit vs native
-int        13.2m   190.4m    23.1m       8.22x            1.8x
-mem        13.1m   334.2m    26.9m      12.41x            2.1x
-flt        21.2m   376.3m    39.2m       9.60x            1.9x
-hash       16.0m   476.6m    47.0m      10.15x            2.9x
-thunk      16.3m   114.1m    46.7m       2.45x            2.9x
+int        12.3m   183.2m    16.9m      10.85x            1.4x
+mem        11.6m   321.2m    14.2m      22.57x            1.2x
+flt        19.7m   368.5m    42.8m       8.60x            2.2x
+hash       14.6m   465.3m    35.9m      12.96x            2.5x
+thunk      15.1m   111.4m    41.8m       2.66x            2.8x
 ```
 
 It compiles 8-, 32- and 64-bit integer operations with register, immediate
@@ -691,17 +691,79 @@ from registers with something in their upper half into memory whose
 neighbours are not zero; until then the extra bytes written had always been
 the bytes already there.
 
+#### Blocks that go straight to the next
+
+Every block used to end by returning to the dispatcher, which hashed the
+next address, looked it up, and entered compiled code again through the
+entry stub. Now an exit to a known address — `jmp`, both sides of a `jcc`,
+`call`, and falling off the end — has a slot that starts as a `nop`, falls
+through to that return, and is overwritten with a branch into the next
+block once it is compiled: at once if it already is, or when it is, from a
+list of exits waiting for it. `ret` and indirect jumps still return. In
+`int`, the whole run now enters compiled code from the dispatcher twelve
+times.
+
+```
+              memory      chained
+              in line
+int            56.5m       39.9m
+mem            65.4m       31.2m
+flt           101.9m      116.4m
+hash          127.7m       95.5m
+thunk         165.8m      149.7m
+```
+
+Two things the dispatcher did had to move into compiled code. Each block
+counts its own instructions on entry, since nothing else sees it run; and an
+exit only chains while the count is below a limit, which is how an
+instruction budget still stops a loop that never comes back. -J sets that
+limit 128 instructions ahead, so a chained run is short enough for the write
+log and is replayed and compared as a whole: the chaining is checked by the
+same comparison as everything else, not switched off for it. The one thing
+-J cannot see is a limit ignored — it replays however many instructions the
+compiled code says it ran — so the mutation script also checks that a
+budget stops a chained loop near where it should.
+
+`flt` got 14% slower. Its loop is now one block branching to itself, which
+should only have saved work. What it shows instead is the cost of keeping
+XMM registers in memory. Measured on this machine, a value stored from a
+general register and loaded back into one costs almost nothing — the core
+forwards it without waiting — but a floating-point value costs about 8
+cycles each way round:
+
+```
+gpr -> gpr  0.38 ns per store and reload
+fp  -> fp   3.60 ns
+gpr -> fp   3.93 ns
+q   -> d    4.57 ns   (a 16-byte store read back 8 bytes at a time)
+```
+
+That is why integer code ran well with its registers in `rsd_cpu` and `flt`
+does not: its loop is a chain of a dozen such round trips through `xmm5`.
+Doing the 128-bit copies and bitwise operations in vector registers instead
+of pairs of general ones made it worse (135ms), as the last row predicts.
+Why the dispatcher's round trip had hidden the cost is not established. The
+remedy is not in doubt: keep XMM values in host registers within a block.
+
+Two failures of the tooling turned up on the way. A mutation that made
+waiting exits branch four words into their target corrupted the stack, and
+rashid died with no report at all: the crash handler ran on the broken
+stack, or rather could not. It now has a stack of its own. And the first
+version of the budget check accepted a budget fault raised after the loop
+had run to completion; it now requires the count it stopped at to be near
+the budget.
+
 #### What would move it further
 
-Going from one block to the next without returning to the dispatcher, which
-is what is left in `int` and `flt`; guest registers in host registers; 16-bit
-operands and the `0x66` prefix; and the SSE long tail. Each is a separate
+XMM values in host registers within a block, which `flt` needs most; then
+general registers likewise, `ret` through a return-address cache, 16-bit
+operands and the `0x66` prefix, and the SSE long tail. Each is a separate
 change, because each needs its own mutations.
 
 #### Checking the checker
 
 A verifier that never fails proves nothing, so `make jit-mutations` breaks
-the compiler thirty-six ways on purpose — an index scale off by one,
+the compiler forty ways on purpose — an index scale off by one,
 RIP-relative addresses measured from the wrong place, an inverted branch, a
 32-bit add done at 64 bits, a push that forgets to move `rsp`, a `cmp` that
 writes its result, `min` returning the wrong operand on NaN, the `le`
@@ -713,7 +775,10 @@ shift by zero done anyway, a shift taking its count from the wrong register,
 a 32-bit multiply done at 64 bits, `setcc` inverted, the eight flag
 mutations above, and six for in-line memory — either region bound taken as
 inclusive, a region kept after `mprotect`, an in-line store not logged, a
-32-bit in-line load or store made at 64 bits — and requires `-J` to catch
+32-bit in-line load or store made at 64 bits — and four for chaining: the
+limit ignored, a block that counts one instruction too many, a chained
+branch that skips the target's prologue, waiting exits sent to the wrong
+block — and requires `-J` to catch
 every one.
 
 Getting there turned up these, each a way a passing test was not evidence:

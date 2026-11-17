@@ -130,6 +130,9 @@ static inline uint32_t a64_strh(int t, int n, uint32_t off) {
     return 0x79000000u | ((off / 2) << 10) | ((uint32_t)n << 5) | (uint32_t)t;
 }
 
+// nop - the placeholder a chained exit starts as
+#define A64_NOP 0xD503201Fu
+
 // b <pc + 4*imm26>
 static inline uint32_t a64_b(int32_t imm26) {
     return 0x14000000u | ((uint32_t)imm26 & 0x3FFFFFFu);
@@ -230,6 +233,20 @@ static inline uint32_t a64_cset(int d, int cond) {
 }
 
 // --- floating point -----------------------------------------------------
+
+// ldr / str Qt, [Xn, #off]   (off a multiple of 16) - whole XMM registers
+static inline uint32_t a64_ldr_q(int t, int n, uint32_t off) {
+    return 0x3DC00000u | ((off / 16) << 10) | ((uint32_t)n << 5) | (uint32_t)t;
+}
+static inline uint32_t a64_str_q(int t, int n, uint32_t off) {
+    return 0x3D800000u | ((off / 16) << 10) | ((uint32_t)n << 5) | (uint32_t)t;
+}
+
+// and / bic / orr / eor  Vd.16b, Vn.16b, Vm.16b
+enum { VOP_AND = 0x4E201C00, VOP_BIC = 0x4E601C00, VOP_ORR = 0x4EA01C00, VOP_EOR = 0x6E201C00 };
+static inline uint32_t a64_vop(int op, int d, int n, int m) {
+    return (uint32_t)op | ((uint32_t)m << 16) | ((uint32_t)n << 5) | (uint32_t)d;
+}
 // Guest XMM lanes live in rsd_cpu, so these load and store them directly.
 
 // ldr/str Dt, [Xn, #off]   (off multiple of 8)   and   St / Wt (multiple of 4)
